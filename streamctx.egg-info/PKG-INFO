@@ -1,0 +1,109 @@
+Metadata-Version: 2.4
+Name: streamctx
+Version: 0.1.0
+Summary: Zero-config LLM call tracing with context reuse and cost insights
+Author: streamctx
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Software Development :: Libraries
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: rich>=13.0.0
+Provides-Extra: openai
+Requires-Dist: openai>=1.0.0; extra == "openai"
+Provides-Extra: anthropic
+Requires-Dist: anthropic>=0.25.0; extra == "anthropic"
+Provides-Extra: all
+Requires-Dist: openai>=1.0.0; extra == "all"
+Requires-Dist: anthropic>=0.25.0; extra == "all"
+Dynamic: author
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# streamctx
+
+Zero-configuration LLM call tracing for OpenAI and Anthropic SDKs. Track token usage, estimate costs, detect repeated context, and see how much you could save.
+
+## Install
+
+```bash
+pip install streamctx
+```
+
+Optional SDK extras:
+
+```bash
+pip install streamctx[all]
+```
+
+## Usage
+
+Only two lines needed:
+
+```python
+import streamctx
+streamctx.start()
+```
+
+After your first LLM call, streamctx automatically prints a terminal summary:
+
+```
+___________________________________________________________________________________________________________________
+streamctx :12 calls | 48210 tokens | $0.73 estimated
+streamctx : 31% cached/reused context | saving : $0.18
+streamctx : biggest waste: repeated system prompt
+streamctx : you could have saved $0.18 (estimated)
+_____________________________________________________________________________________________________________________
+```
+
+## API
+
+| Function | Description |
+|---|---|
+| `streamctx.start()` | Enable tracing; auto-detects OpenAI and Anthropic SDK calls via monkeypatching |
+| `streamctx.wrap(client)` | Manually instrument a specific client instance |
+| `streamctx.report()` | Print a full Rich terminal summary |
+| `streamctx.stop()` | Disable tracking and close the session |
+
+### Manual instrumentation
+
+```python
+import streamctx
+from openai import OpenAI
+
+streamctx.start()
+client = streamctx.wrap(OpenAI())
+```
+
+## Features
+
+- **Monkeypatching** — Automatically hooks OpenAI `chat.completions.create` and Anthropic `messages.create`
+- **Pricing table** — GPT-4o, GPT-3.5, Claude Sonnet, Claude Haiku
+- **Context-diff engine** — Detects repeated system prompts and messages
+- **SQLite storage** — Session history persisted to `~/.streamctx/sessions.db`
+- **Rich output** — Beautiful terminal summaries with savings estimates
+- **Zero config** — Works on first run with no setup
+
+## Supported models
+
+| Model | Input / 1M tokens | Output / 1M tokens |
+|---|---|---|
+| GPT-4o | $2.50 | $10.00 |
+| GPT-3.5 | $0.50 | $1.50 |
+| Claude Sonnet | $3.00 | $15.00 |
+| Claude Haiku | $0.25 | $1.25 |
+
+## License
+
+MIT
