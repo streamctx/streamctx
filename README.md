@@ -69,7 +69,22 @@ client = streamctx.wrap(OpenAI())
 | GPT-4o | $2.50 | $10.00 |
 | GPT-3.5 | $0.50 | $1.50 |
 | Claude Sonnet | $3.00 | $15.00 |
-| Claude Haiku | $0.25 | $1.25 |
+| Claude Haiku | $0.25 | $1.25 | 
+
+## Why Streamctx Exists
+
+Production LLM costs surprise every team.
+in development becomes $47,000/month when agent scale.
+StreamCtx give you token-level visibility on the first run- no configuration, no guessing.
+
+## Built with 
+
+- Python - core implementation
+- OpenAI SDK + Anthropic SDK - Integration Layer
+- SQLite - Session persistence
+- Rich - Terminal formatting
+
+ Devloped Using modern AI- assisted development tools.
 
 ## License
 
