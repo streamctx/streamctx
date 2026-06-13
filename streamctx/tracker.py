@@ -152,37 +152,67 @@ class LLMTracker:
                 self.state.storage.end_session(self.state.session_id)
             self.state.active = False
 
+    def _ensure_session(self) -> None:
+        if not self.state.active:
+            self.state.active = True
+            self.state.session_id = self.state.storage.start_session()
+
+
     def wrap(self, client: Any) -> Any:
         """Manually instrument a client instance."""
+        self._ensure_session()
+
         client_id = id(client)
         if client_id in self.state._wrapped_clients:
             return client
 
         if hasattr(client, "chat") and hasattr(client.chat, "completions"):
-            original = client.chat.completions.create
+            key = "openai.resources.chat.completions.Completions.create"
+            if key in self.state._originals:
+                self.state._wrapped_clients.add(client_id)
+                return client
+
+            import openai.resources.chat.completions.completions as completions_mod
+
+            completions = client.chat.completions
+            original_create = self.state._originals.get(
+                key, completions_mod.Completions.create
+            )
+            tracker = self
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
-                return self._intercept_call(
-                    lambda: original(*args, **kwargs),
+                return tracker._intercept_call(
+                    lambda: original_create(completions, *args, **kwargs),
                     provider="openai",
                     kwargs=kwargs,
                 )
 
-            client.chat.completions.create = patched_create
+            completions.create = patched_create
             self.state._wrapped_clients.add(client_id)
             return client
 
         if hasattr(client, "messages") and hasattr(client.messages, "create"):
-            original = client.messages.create
+            key = "anthropic.resources.messages.Messages.create"
+            if key in self.state._originals:
+                self.state._wrapped_clients.add(client_id)
+                return client
+
+            import anthropic.resources.messages.messages as messages_mod
+
+            messages = client.messages
+            original_create = self.state._originals.get(
+                key, messages_mod.Messages.create
+            )
+            tracker = self
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
-                return self._intercept_call(
-                    lambda: original(*args, **kwargs),
+                return tracker._intercept_call(
+                    lambda: original_create(messages, *args, **kwargs),
                     provider="anthropic",
                     kwargs=kwargs,
                 )
 
-            client.messages.create = patched_create
+            messages.create = patched_create
             self.state._wrapped_clients.add(client_id)
             return client
 
@@ -206,14 +236,26 @@ class LLMTracker:
         self._patch_anthropic()
 
     def _unpatch_sdks(self) -> None:
-        for key, original in self.state._originals.items():
-            module_path, attr = key.rsplit(".", 1)
-            parts = module_path.split(".")
-            obj: Any = __import__(parts[0])
-            for part in parts[1:]:
-                obj = getattr(obj, part)
-            setattr(obj, attr, original)
+        for key, original in list(self.state._originals.items()):
+            cls = self._resolve_patch_target(key)
+            if cls is not None:
+                setattr(cls, "create", original)
         self.state._originals.clear()
+        self.state._wrapped_clients.clear()
+
+    def _resolve_patch_target(self, key: str) -> Any:
+        try:
+            if key.startswith("openai."):
+                import openai.resources.chat.completions.completions as mod
+
+                return mod.Completions
+            if key.startswith("anthropic."):
+                import anthropic.resources.messages.messages as mod
+
+                return mod.Messages
+        except ImportError:
+            return None
+        return None
 
     def _patch_openai(self) -> None:
         try:

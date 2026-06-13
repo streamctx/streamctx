@@ -19,20 +19,20 @@ __all__ = ["start", "wrap", "report", "stop", "__version__"]
 
 
 def start() -> None:
-    """Enable tracing and auto-detect OpenAI / Anthropic SDK calls."""
+    """Enable tracing, monkeypatch OpenAI/Anthropic SDKs, and start token tracking."""
     get_tracker().start()
 
 
 def wrap(client: Any) -> Any:
-    """Manually instrument an OpenAI or Anthropic client instance."""
+    """Manually wrap an OpenAI or Anthropic client for token tracking."""
     return get_tracker().wrap(client)
 
 
 def report() -> None:
-    """Print a Rich terminal summary of the current session."""
+    """Print a terminal summary with token counts, cost, and context reuse."""
     print_report(get_tracker())
 
 
 def stop() -> None:
-    """Disable tracking and close the current session."""
+    """Stop tracking, restore SDK patches, and close the session."""
     get_tracker().stop()
