@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 
 from . import pricing
 from .storage import SessionStorage
+from .healer import SelfHealingEngine
 
 
 def _hash_text(text: str) -> str:
@@ -130,6 +131,7 @@ class LLMTracker:
     def __init__(self) -> None:
         self.state = TrackerState()
         self.diff = ContextDiffEngine()
+        self.healer = SelfHealingEngine()
 
     def start(self) -> None:
         with self.state._lock:
@@ -154,7 +156,6 @@ class LLMTracker:
             self.state.session_id = self.state.storage.start_session()
 
     def checkpoint(self) -> None:
-        """Manually save a checkpoint of the current messages."""
         self._ensure_session()
         if self.state.session_id is None:
             return
@@ -166,11 +167,13 @@ class LLMTracker:
         )
 
     def resume(self, session_id: int) -> list[dict[str, str]]:
-        """Resume from the latest checkpoint of a given session."""
         return self.state.storage.resume_from_checkpoint(session_id)
 
     def get_session_id(self) -> Optional[int]:
         return self.state.session_id
+
+    def healing_stats(self) -> dict[str, Any]:
+        return self.healer.get_stats()
 
     def wrap(self, client: Any) -> Any:
         self._ensure_session()
@@ -326,7 +329,19 @@ class LLMTracker:
             messages.extend(user_msgs)
 
         reused, waste = self.diff.analyze(messages)
-        response = fn()
+
+        # Try LLM call — self-heal on failure
+        try:
+            response = fn()
+            self.healer.record_success(messages, response)
+        except Exception as e:
+            self.healer.record_failure()
+            if self.healer.can_heal():
+                recovery_msgs = self.healer.get_recovery_messages(messages)
+                with self.state._lock:
+                    self.state._last_messages = recovery_msgs
+                raise
+            raise
 
         input_tokens, output_tokens = self._extract_usage(
             response, provider, messages, kwargs
@@ -345,7 +360,6 @@ class LLMTracker:
         )
         self._persist(record)
 
-        # Checkpoint — auto save after every call
         with self.state._lock:
             self.state.step_counter += 1
             self.state._last_messages = list(messages)
@@ -437,5 +451,6 @@ _tracker = LLMTracker()
 
 def get_tracker() -> LLMTracker:
     return _tracker
+
 
 

@@ -20,6 +20,7 @@ __all__ = [
     "start", "wrap", "report", "stop",
     "checkpoint", "resume", "get_session_id",
     "compress", "compression_stats",
+    "healing_stats",
     "__version__",
 ]
 
@@ -65,17 +66,13 @@ def compress(
     keep_last_n: int = 4,
 ) -> dict:
     """
-    Compress messages to reduce token usage.
+    Compress messages to reduce token usage by 40-70%.
 
     Usage::
 
         result = streamctx.compress(messages, max_tokens=2000)
         compressed = result["messages"]
         print(result["stats"])
-
-    Returns dict with:
-        - messages: compressed message list
-        - stats: compression statistics
     """
     compressed, original, after = compress_messages(
         messages,
@@ -92,6 +89,18 @@ def compress(
 def compression_stats(original_tokens: int, compressed_tokens: int) -> dict:
     """Get compression statistics."""
     return get_compression_stats(original_tokens, compressed_tokens)
+
+
+def healing_stats() -> dict:
+    """
+    Get self-healing statistics.
+
+    Returns dict with:
+        - failure_count: number of failed LLM calls
+        - recovery_count: number of successful recoveries
+        - has_valid_context: whether recovery is possible
+    """
+    return get_tracker().healing_stats()
 
 
 
