@@ -17,7 +17,6 @@ def _hash_text(text: str) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate (~4 chars per token)."""
     if not text:
         return 0
     return max(1, len(text) // 4)
@@ -82,15 +81,15 @@ class TrackerState:
     seen_hashes: set[str] = field(default_factory=set)
     waste_counter: Counter = field(default_factory=Counter)
     call_count: int = 0
+    step_counter: int = 0
     auto_reported: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _originals: dict[str, Any] = field(default_factory=dict)
     _wrapped_clients: set[int] = field(default_factory=set)
+    _last_messages: list[dict[str, str]] = field(default_factory=list)
 
 
 class ContextDiffEngine:
-    """Detect repeated prompts and quantify reusable context."""
-
     def __init__(self) -> None:
         self._seen: dict[str, int] = {}
         self._system_prompts: Counter = Counter()
@@ -98,7 +97,6 @@ class ContextDiffEngine:
     def analyze(self, messages: list[dict[str, str]]) -> tuple[int, Optional[str]]:
         reused = 0
         waste: Optional[str] = None
-
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -106,7 +104,6 @@ class ContextDiffEngine:
                 continue
             h = _hash_text(f"{role}:{content}")
             tokens = _estimate_tokens(content)
-
             if h in self._seen:
                 reused += tokens
                 if role == "system":
@@ -119,7 +116,6 @@ class ContextDiffEngine:
                     waste = "repeated assistant context"
             else:
                 self._seen[h] = tokens
-
         if waste is None and self._system_prompts:
             waste = "repeated system prompt"
         return reused, waste
@@ -157,11 +153,27 @@ class LLMTracker:
             self.state.active = True
             self.state.session_id = self.state.storage.start_session()
 
+    def checkpoint(self) -> None:
+        """Manually save a checkpoint of the current messages."""
+        self._ensure_session()
+        if self.state.session_id is None:
+            return
+        with self.state._lock:
+            messages = list(self.state._last_messages)
+            step = self.state.step_counter
+        self.state.storage.save_checkpoint(
+            self.state.session_id, step, messages
+        )
+
+    def resume(self, session_id: int) -> list[dict[str, str]]:
+        """Resume from the latest checkpoint of a given session."""
+        return self.state.storage.resume_from_checkpoint(session_id)
+
+    def get_session_id(self) -> Optional[int]:
+        return self.state.session_id
 
     def wrap(self, client: Any) -> Any:
-        """Manually instrument a client instance."""
         self._ensure_session()
-
         client_id = id(client)
         if client_id in self.state._wrapped_clients:
             return client
@@ -171,9 +183,7 @@ class LLMTracker:
             if key in self.state._originals:
                 self.state._wrapped_clients.add(client_id)
                 return client
-
             import openai.resources.chat.completions.completions as completions_mod
-
             completions = client.chat.completions
             original_create = self.state._originals.get(
                 key, completions_mod.Completions.create
@@ -196,9 +206,7 @@ class LLMTracker:
             if key in self.state._originals:
                 self.state._wrapped_clients.add(client_id)
                 return client
-
             import anthropic.resources.messages.messages as messages_mod
-
             messages = client.messages
             original_create = self.state._originals.get(
                 key, messages_mod.Messages.create
@@ -247,11 +255,9 @@ class LLMTracker:
         try:
             if key.startswith("openai."):
                 import openai.resources.chat.completions.completions as mod
-
                 return mod.Completions
             if key.startswith("anthropic."):
                 import anthropic.resources.messages.messages as mod
-
                 return mod.Messages
         except ImportError:
             return None
@@ -262,7 +268,6 @@ class LLMTracker:
             import openai
         except ImportError:
             return
-
         if hasattr(openai, "resources") and hasattr(openai.resources, "chat"):
             completions_cls = openai.resources.chat.completions.Completions
             key = "openai.resources.chat.completions.Completions.create"
@@ -270,9 +275,7 @@ class LLMTracker:
                 self.state._originals[key] = completions_cls.create
                 tracker = self
 
-                def patched_create(
-                    self_completions: Any, *args: Any, **kwargs: Any
-                ) -> Any:
+                def patched_create(self_completions: Any, *args: Any, **kwargs: Any) -> Any:
                     original = tracker.state._originals[key]
                     return tracker._intercept_call(
                         lambda: original(self_completions, *args, **kwargs),
@@ -287,7 +290,6 @@ class LLMTracker:
             import anthropic
         except ImportError:
             return
-
         if hasattr(anthropic, "resources") and hasattr(anthropic.resources, "messages"):
             messages_cls = anthropic.resources.messages.Messages
             key = "anthropic.resources.messages.Messages.create"
@@ -295,9 +297,7 @@ class LLMTracker:
                 self.state._originals[key] = messages_cls.create
                 tracker = self
 
-                def patched_create(
-                    self_messages: Any, *args: Any, **kwargs: Any
-                ) -> Any:
+                def patched_create(self_messages: Any, *args: Any, **kwargs: Any) -> Any:
                     original = tracker.state._originals[key]
                     return tracker._intercept_call(
                         lambda: original(self_messages, *args, **kwargs),
@@ -345,6 +345,17 @@ class LLMTracker:
         )
         self._persist(record)
 
+        # Checkpoint — auto save after every call
+        with self.state._lock:
+            self.state.step_counter += 1
+            self.state._last_messages = list(messages)
+            step = self.state.step_counter
+
+        if self.state.session_id is not None:
+            self.state.storage.save_checkpoint(
+                self.state.session_id, step, messages
+            )
+
         with self.state._lock:
             self.state.call_count += 1
             if waste:
@@ -355,7 +366,6 @@ class LLMTracker:
 
         if first_call:
             from .reporter import print_auto_summary
-
             print_auto_summary(self)
 
         return response
@@ -384,7 +394,6 @@ class LLMTracker:
     ) -> tuple[int, int]:
         input_tokens = 0
         output_tokens = 0
-
         usage = getattr(response, "usage", None)
         if usage is not None:
             input_tokens = int(
@@ -400,9 +409,7 @@ class LLMTracker:
         elif isinstance(response, dict) and "usage" in response:
             u = response["usage"]
             input_tokens = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
-            output_tokens = int(
-                u.get("completion_tokens") or u.get("output_tokens") or 0
-            )
+            output_tokens = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
 
         if input_tokens == 0:
             input_tokens = sum(_estimate_tokens(m["content"]) for m in messages)
@@ -413,17 +420,12 @@ class LLMTracker:
         if output_tokens == 0:
             if provider == "openai":
                 try:
-                    output_tokens = _estimate_tokens(
-                        response.choices[0].message.content
-                    )
+                    output_tokens = _estimate_tokens(response.choices[0].message.content)
                 except (AttributeError, IndexError, TypeError):
                     output_tokens = 0
             elif provider == "anthropic":
                 try:
-                    blocks = response.content
-                    output_tokens = _estimate_tokens(
-                        _extract_text(blocks)
-                    )
+                    output_tokens = _estimate_tokens(_extract_text(response.content))
                 except (AttributeError, IndexError, TypeError):
                     output_tokens = 0
 
@@ -435,3 +437,5 @@ _tracker = LLMTracker()
 
 def get_tracker() -> LLMTracker:
     return _tracker
+
+

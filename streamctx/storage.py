@@ -1,4 +1,4 @@
-"""SQLite-backed session history storage."""
+"""SQLite storage for streamctx sessions and checkpoints."""
 
 from __future__ import annotations
 
@@ -52,6 +52,14 @@ class SessionStorage:
                         messages_json TEXT,
                         FOREIGN KEY (session_id) REFERENCES sessions(id)
                     );
+                    CREATE TABLE IF NOT EXISTS checkpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL,
+                        step_number INTEGER NOT NULL,
+                        messages_json TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        FOREIGN KEY (session_id) REFERENCES sessions(id)
+                    );
                     """
                 )
 
@@ -60,8 +68,7 @@ class SessionStorage:
         with self._lock:
             with self._connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO sessions (started_at) VALUES (?)",
-                    (now,),
+                    "INSERT INTO sessions (started_at) VALUES (?)", (now,),
                 )
                 conn.commit()
                 return int(cur.lastrowid)
@@ -100,19 +107,60 @@ class SessionStorage:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        session_id,
-                        now,
-                        provider,
-                        model,
-                        input_tokens,
-                        output_tokens,
-                        cost,
-                        reused_tokens,
-                        waste_category,
+                        session_id, now, provider, model,
+                        input_tokens, output_tokens, cost,
+                        reused_tokens, waste_category,
                         json.dumps(messages),
                     ),
                 )
                 conn.commit()
+
+    def save_checkpoint(
+        self,
+        session_id: int,
+        step_number: int,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Save current messages as a checkpoint after each LLM call."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO checkpoints (session_id, step_number, messages_json, timestamp)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (session_id, step_number, json.dumps(messages), now),
+                )
+                conn.commit()
+
+    def get_latest_checkpoint(self, session_id: int) -> Optional[dict[str, Any]]:
+        """Get the most recent checkpoint for a session."""
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT step_number, messages_json, timestamp
+                    FROM checkpoints
+                    WHERE session_id = ?
+                    ORDER BY step_number DESC LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+        if row is None:
+            return None
+        return {
+            "step_number": row["step_number"],
+            "messages": json.loads(row["messages_json"]),
+            "timestamp": row["timestamp"],
+        }
+
+    def resume_from_checkpoint(self, session_id: int) -> list[dict[str, Any]]:
+        """Return messages from the latest checkpoint to resume from."""
+        result = self.get_latest_checkpoint(session_id)
+        if result is None:
+            return []
+        return result["messages"]
 
     def get_session_stats(self, session_id: int) -> dict[str, Any]:
         with self._lock:
@@ -135,8 +183,7 @@ class SessionStorage:
                     FROM calls
                     WHERE session_id = ? AND waste_category IS NOT NULL
                     GROUP BY waste_category
-                    ORDER BY cnt DESC
-                    LIMIT 1
+                    ORDER BY cnt DESC LIMIT 1
                     """,
                     (session_id,),
                 ).fetchone()
@@ -149,3 +196,5 @@ class SessionStorage:
             "reused_tokens": int(row["reused_tokens"]),
             "biggest_waste": waste_rows["waste_category"] if waste_rows else None,
         }
+
+
