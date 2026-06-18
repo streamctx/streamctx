@@ -13,11 +13,13 @@ from typing import Any
 
 from .reporter import print_auto_summary, print_report
 from .tracker import get_tracker
+from .compressor import compress_messages, get_compression_stats
 
 __version__ = "0.1.0"
 __all__ = [
     "start", "wrap", "report", "stop",
     "checkpoint", "resume", "get_session_id",
+    "compress", "compression_stats",
     "__version__",
 ]
 
@@ -48,18 +50,48 @@ def checkpoint() -> None:
 
 
 def resume(session_id: int) -> list:
-    """Resume from the latest checkpoint of a given session.
-
-    Returns the list of messages from the last checkpoint.
-
-    Usage::
-        messages = streamctx.resume(session_id)
-    """
+    """Resume from the latest checkpoint of a given session."""
     return get_tracker().resume(session_id)
 
 
 def get_session_id() -> int | None:
     """Get the current active session ID."""
     return get_tracker().get_session_id()
+
+
+def compress(
+    messages: list,
+    max_tokens: int = 2000,
+    keep_last_n: int = 4,
+) -> dict:
+    """
+    Compress messages to reduce token usage.
+
+    Usage::
+
+        result = streamctx.compress(messages, max_tokens=2000)
+        compressed = result["messages"]
+        print(result["stats"])
+
+    Returns dict with:
+        - messages: compressed message list
+        - stats: compression statistics
+    """
+    compressed, original, after = compress_messages(
+        messages,
+        max_tokens=max_tokens,
+        keep_last_n=keep_last_n,
+    )
+    stats = get_compression_stats(original, after)
+    return {
+        "messages": compressed,
+        "stats": stats,
+    }
+
+
+def compression_stats(original_tokens: int, compressed_tokens: int) -> dict:
+    """Get compression statistics."""
+    return get_compression_stats(original_tokens, compressed_tokens)
+
 
 
