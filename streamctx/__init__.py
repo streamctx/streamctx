@@ -14,15 +14,19 @@ from typing import Any
 from .reporter import print_auto_summary, print_report
 from .tracker import get_tracker
 from .compressor import compress_messages, get_compression_stats
+from .poison_detector import PoisonDetector
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "start", "wrap", "report", "stop",
     "checkpoint", "resume", "get_session_id",
     "compress", "compression_stats",
     "healing_stats",
+    "scan",
     "__version__",
 ]
+
+_detector = PoisonDetector()
 
 
 def start() -> None:
@@ -92,15 +96,35 @@ def compression_stats(original_tokens: int, compressed_tokens: int) -> dict:
 
 
 def healing_stats() -> dict:
-    """
-    Get self-healing statistics.
-
-    Returns dict with:
-        - failure_count: number of failed LLM calls
-        - recovery_count: number of successful recoveries
-        - has_valid_context: whether recovery is possible
-    """
+    """Get self-healing statistics."""
     return get_tracker().healing_stats()
 
+
+def scan(messages: list) -> dict:
+    """
+    Scan messages for context poisoning.
+
+    Detects:
+    - Repeated errors (agent stuck in loop)
+    - Contradictory facts
+    - Error accumulation
+    - Repetitive responses
+
+    Usage::
+
+        result = streamctx.scan(messages)
+        print(result["health_score"])   # 0-100
+        print(result["warnings"])       # list of issues
+        print(result["recommendation"]) # what to do
+
+    Returns:
+        {
+            "health_score": int,
+            "is_poisoned": bool,
+            "warnings": list[str],
+            "recommendation": str
+        }
+    """
+    return _detector.scan(messages)
 
 
