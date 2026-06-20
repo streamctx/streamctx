@@ -5,12 +5,15 @@ with open("README.md", encoding="utf-8") as f:
 
 setup(
     name="streamctx",
-    version="0.1.0",
-    description="Zero-config LLM call tracing with context reuse and cost insights",
+    version="0.3.1",
+    description="Context health monitoring for AI agents — detect poisoning, drift, loops",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="streamctx",
-    packages=find_packages(),
+    author="Sneh R Joshi",
+    author_email="joshisneh51@gmail.com",
+    url="https://github.com/streamctx/streamctx",
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
     python_requires=">=3.9",
     install_requires=[
         "rich>=13.0.0",
@@ -30,5 +33,11 @@ setup(
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Topic :: Software Development :: Libraries",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
+    keywords=[
+        "llm", "ai", "agent", "context", "monitoring",
+        "observability", "openai", "anthropic", "token",
+        "checkpoint", "compression", "self-healing",
     ],
 )

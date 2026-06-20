@@ -22,7 +22,7 @@ tracker.state._last_messages = [
 ]
 tracker.state.step_counter = 1
 streamctx.checkpoint()
-print("✅ Checkpoint 1 saved (step 1)")
+print("")
 
 # Simulate Step 2
 tracker.state._last_messages = [

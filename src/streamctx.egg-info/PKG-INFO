@@ -1,0 +1,205 @@
+Metadata-Version: 2.4
+Name: streamctx
+Version: 0.3.1
+Summary: Context health monitoring for AI agents — detect poisoning, drift, loops
+Home-page: https://github.com/streamctx/streamctx
+Author: Sneh R Joshi
+Author-email: joshisneh51@gmail.com
+Keywords: llm,ai,agent,context,monitoring,observability,openai,anthropic,token,checkpoint,compression,self-healing
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: rich>=13.0.0
+Provides-Extra: openai
+Requires-Dist: openai>=1.0.0; extra == "openai"
+Provides-Extra: anthropic
+Requires-Dist: anthropic>=0.25.0; extra == "anthropic"
+Provides-Extra: all
+Requires-Dist: openai>=1.0.0; extra == "all"
+Requires-Dist: anthropic>=0.25.0; extra == "all"
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license-file
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+
+# StreamCtx 🧠
+
+**Your AI agent is silently corrupting its own context. StreamCtx detects it — and fixes it.**
+
+## Install
+
+pip install streamctx
+
+## 2-Line Setup
+
+import streamctx
+streamctx.start()  # patches OpenAI + Anthropic automatically
+
+---
+
+## The Problem Nobody Talks About
+
+You ship an AI agent. It works perfectly in demos.
+
+Then in production:
+- Agent gets stuck repeating the same failed action 58 times
+- Context from step 3 contradicts context from step 7
+- Agent hallucinates a tool call, writes it to memory, references it forever
+- Your $0.50 task costs $50 because nobody set a limit
+
+Every LLM observability tool tracks tokens. Nobody tracks context health.
+
+Until now.
+
+---
+
+## What StreamCtx Does
+
+### 1. Context Poison Detection
+
+result = streamctx.scan(messages)
+print(result["health_score"])    # 25/100
+print(result["warnings"])
+# ⚠️  Repeated errors: 'failed' 4x — agent stuck in loop
+# 🚨 Context severely poisoned — resume from checkpoint
+
+### 2. Context Diff — See Exactly What Changed
+
+diff = streamctx.context_diff(step3_msgs, step7_msgs, step_a=3, step_b=7)
+print(diff["summary"])
+# ⚠️  System prompt REMOVED — agent lost instructions
+# ⚠️  Contradiction: 'use gpt' added but 'use claude' removed
+# Drift Score: 50/100
+
+### 3. Auto-Checkpoint + Resume
+
+session_id = streamctx.get_session_id()
+messages = streamctx.resume(session_id)
+# Pick up exactly where agent left off
+
+### 4. 50% Token Compression
+
+result = streamctx.compress(messages, max_tokens=2000)
+# 140 tokens → 70 tokens (50% reduction)
+
+### 5. Self-Healing
+
+stats = streamctx.healing_stats()
+# failures: 1, recoveries: 1
+
+### 6. Full Session Report
+
+streamctx.report()
+streamctx.stop()
+
+---
+
+## Feature Comparison
+
+Feature              | StreamCtx | Langfuse | LangSmith | Mem0
+---------------------|-----------|----------|-----------|-----
+Token tracking       |     YES   |    YES   |    YES    |  NO
+Cost estimation      |     YES   |    YES   |    YES    |  NO
+Context Poison Det.  |     YES   |    NO    |    NO     |  NO
+Context Diff         |     YES   |    NO    |    NO     |  NO
+Auto-checkpoint      |     YES   |    NO    |    NO     |  NO
+50% Compression      |     YES   |    NO    |    NO     |  NO
+Self-healing         |     YES   |    NO    |    NO     |  NO
+Zero config          |     YES   |    NO    |    NO     |  NO
+Open source          |     YES   |    YES   |    NO     |  NO
+
+---
+
+## Quick Start
+
+import streamctx
+from openai import OpenAI
+
+streamctx.start()
+client = OpenAI()
+
+messages = [{"role": "user", "content": "Hello!"}]
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=messages,
+)
+
+result = streamctx.scan(messages)
+print(result["health_score"])
+print(result["recommendation"])
+
+streamctx.report()
+streamctx.stop()
+
+---
+
+## API Reference
+
+streamctx.start()                    # start tracking
+streamctx.stop()                     # stop tracking
+streamctx.report()                   # print full report
+streamctx.wrap(client)               # manually wrap client
+
+streamctx.scan(messages)             # context health score
+streamctx.context_diff(a, b)         # compare two steps
+
+streamctx.checkpoint()               # save checkpoint
+streamctx.resume(session_id)         # resume from checkpoint
+streamctx.get_session_id()           # current session ID
+
+streamctx.compress(messages)         # 50% token compression
+streamctx.healing_stats()            # self-healing stats
+
+---
+
+## Why StreamCtx?
+
+Most tools answer: "How many tokens did I use?"
+
+StreamCtx answers: "Why is my agent broken — and how do I fix it?"
+
+---
+
+## Roadmap
+
+DONE:
+- Token tracking + cost estimation
+- Context poison detection
+- Context diff + drift scoring
+- Auto-checkpoint + resume
+- 50% token compression
+- Self-healing engine
+
+COMING:
+- Context budget manager (v0.4.0)
+- Visual dashboard
+- Multi-agent support
+
+---
+
+## License
+
+MIT - Sneh R Joshi
+
+Built by a solo founder who got tired of AI agents silently going insane.
+
+

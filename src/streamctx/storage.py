@@ -198,3 +198,16 @@ class SessionStorage:
         }
 
 
+
+def get_storage() -> "SessionStorage":
+    """
+    Factory function — STREAMCTX_BACKEND env var check kare ane
+    sachu storage backend return kare (sqlite athva supabase).
+    """
+    backend = os.environ.get("STREAMCTX_BACKEND", "sqlite").lower()
+
+    if backend == "supabase":
+        from .supabase_storage import SupabaseStorage
+        return SupabaseStorage()
+
+    return SessionStorage()
