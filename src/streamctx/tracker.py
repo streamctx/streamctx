@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from . import pricing
-from .storage import SessionStorage
+from .storage import get_storage
 from .healer import SelfHealingEngine
 
 
@@ -78,7 +78,7 @@ class CallRecord:
 class TrackerState:
     active: bool = False
     session_id: Optional[int] = None
-    storage: SessionStorage = field(default_factory=SessionStorage)
+    storage: Any = field(default_factory=get_storage)
     seen_hashes: set[str] = field(default_factory=set)
     waste_counter: Counter = field(default_factory=Counter)
     call_count: int = 0
