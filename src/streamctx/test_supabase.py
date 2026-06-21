@@ -1,4 +1,4 @@
-from supabase_storage import SupabaseStorage # તમારી ફાઈલનું નામ જે રાખ્યું હોય તે
+from src.streamctx.supabase_storage import SupabaseStorage # તમારી ફાઈલનું નામ જે રાખ્યું હોય તે
 
 # 1. કનેક્શન ચેક કરવા માટે ઓબ્જેક્ટ બનાવો
 db = SupabaseStorage()

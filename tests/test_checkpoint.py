@@ -1,24 +1,26 @@
 
 """Pytest version of StreamCtx checkpoint system test."""
 
-import streamctx
-from streamctx.tracker import get_tracker
+
+from src.streamctx.tracker import get_tracker
 
 
 def test_checkpoint_and_resume():
+    
     """Checkpoint should save state, and resume should restore exact messages."""
-    streamctx.start()
-    session_id = streamctx.get_session_id()
+    tracker = get_tracker()
+    tracker.start()
+    session_id=tracker.state.session_id
     assert session_id is not None
 
-    tracker = get_tracker()
 
     tracker.state._last_messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What is Python?"},
     ]
     tracker.state.step_counter = 1
-    streamctx.checkpoint()
+
+    tracker.checkpoint()
 
     tracker.state._last_messages = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -27,9 +29,9 @@ def test_checkpoint_and_resume():
         {"role": "user", "content": "Tell me more."},
     ]
     tracker.state.step_counter = 2
-    streamctx.checkpoint()
+    tracker.checkpoint()
 
-    messages = streamctx.resume(session_id)
+    messages = tracker.resume(session_id)
 
     assert len(messages) == 4
     assert messages[0]["role"] == "system"
@@ -37,12 +39,15 @@ def test_checkpoint_and_resume():
     assert messages[2]["content"] == "Python is a programming language."
     assert messages[3]["content"] == "Tell me more."
 
-    streamctx.stop()
+    tracker.stop()
 
 
 def test_resume_unknown_session_returns_empty_or_raises():
+
     """Resuming a session that never checkpointed should not silently fabricate data."""
-    result = streamctx.resume(999999999)
+
+    tracker = get_tracker()
+    result = tracker.resume(999999999)
     assert result == [] or result is None
 
 
