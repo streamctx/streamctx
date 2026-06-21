@@ -128,7 +128,8 @@ class ContextDiffEngine:
 
 
 class LLMTracker:
-    def __init__(self) -> None:
+    def __init__(self):
+        self._session_id=None
         self.state = TrackerState()
         self.diff = ContextDiffEngine()
         self.healer = SelfHealingEngine()
