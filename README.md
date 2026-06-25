@@ -1,4 +1,5 @@
-# StreamCtx 🧠
+# StreamCtx 
+![StreamCtx Demo](assets/demo.gif)
 
 **Your AI agent is silently corrupting its own context. StreamCtx detects it — and fixes it.**
 
