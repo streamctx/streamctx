@@ -3,3 +3,5 @@ supabase
 httpx
 openai
 python-dotenv
+pandas
+streamlit
