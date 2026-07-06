@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from . import pricing
+from . import attribution
 
 if TYPE_CHECKING:
     from .tracker import LLMTracker
@@ -18,6 +19,10 @@ console = Console()
 
 
 def _format_dollars(amount: float) -> str:
+    if amount == 0:
+        return "$0.00"
+    if amount < 0.01:
+        return f"${amount:.4f}"
     return f"${amount:.2f}"
 
 
@@ -80,7 +85,7 @@ def print_report(tracker: "LLMTracker") -> None:
     tokens = stats["total_tokens"]
     cost = stats["total_cost"]
     cache_pct = _cache_pct(stats)
-    savings = _compute_savings(stats)
+    savings = _compute_savings(stats, model=stats.get("model") or "gpt-4o-mini")
     waste = _resolve_waste(stats, tracker)
     could_save = max(savings, cost * 0.25) if cost > 0 else savings
 
@@ -98,31 +103,36 @@ def print_report(tracker: "LLMTracker") -> None:
         "You could have saved",
         Text(_format_dollars(could_save) + " (estimated)", style="bold green"),
     )
+    
+     # Causal failure attribution content
+    engine = attribution.get_attribution_engine()
+    results = engine.attribute_session(tracker.session_id)
+
+    if results:
+        attribution_text = "\n".join(r.reason for r in results)
+    else:
+        attribution_text = "No failures in this session - all calls succeeded." 
+
+     # Causal failure attribution as its own boxed section
+        attribution_panel = Panel(
+        attribution_text,
+        title="[bold]Causal Failure Attribution[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+
+    combined = Group(
+        table,
+        Text("\n"),
+        attribution_panel,
+    )
 
     panel = Panel(
-        table,
+        combined,
         title="[bold]streamctx session report[/bold]",
         border_style="bright_blue",
         padding=(1, 2),
     )
+   
     console.print(panel)
 
-    pricing_table = Table(show_header=True, header_style="bold magenta")
-    pricing_table.add_column("Model")
-    pricing_table.add_column("Input / 1M", justify="right")
-    pricing_table.add_column("Output / 1M", justify="right")
-
-    seen: set[str] = set()
-    for key, p in pricing.PRICING_TABLE.items():
-        if p.display_name in seen:
-            continue
-        seen.add(p.display_name)
-        pricing_table.add_row(
-            p.display_name,
-            _format_dollars(p.input_per_million),
-            _format_dollars(p.output_per_million),
-        )
-
-    console.print(
-        Panel(pricing_table, title="Supported pricing", border_style="dim")
-    )

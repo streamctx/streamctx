@@ -72,6 +72,9 @@ class CallRecord:
     reused_tokens: int
     waste_category: Optional[str]
     messages: list[dict[str, str]]
+    failed: bool = False
+    healed: bool = False
+    error_message: Optional[str] = None
 
 
 @dataclass
@@ -91,9 +94,10 @@ class TrackerState:
 
 
 class ContextDiffEngine:
-    def __init__(self) -> None:
-        self._seen: dict[str, int] = {}
+    def __init__(self)->None:
+        self._seen: dict[str,int]={}
         self._system_prompts: Counter = Counter()
+
 
     def analyze(self, messages: list[dict[str, str]]) -> tuple[int, Optional[str]]:
         reused = 0
@@ -105,17 +109,23 @@ class ContextDiffEngine:
                 continue
             h = _hash_text(f"{role}:{content}")
             tokens = _estimate_tokens(content)
-            if h in self._seen:
+
+            # NEW: system prompts are always 100% reusable across calls
+            if role == "system":
                 reused += tokens
-                if role == "system":
-                    waste = "repeated system prompt"
-                    self._system_prompts[content[:120]] += 1
-                elif role == "user":
-                    if waste is None:
-                        waste = "repeated user message"
-                elif role == "assistant" and waste is None:
-                    waste = "repeated assistant context"
-            else:
+                self._system_prompts[content[:120]] += 1
+                waste = "repeated system prompt"
+                continue   
+ 
+                if h in self._seen:
+                    reused += tokens
+                    if role == "system":
+                        if waste is None:
+                            waste = "repeated user message"
+            elif role == "assistant" and waste is None:
+                waste ="repeated assistant context"
+
+                    
                 self._seen[h] = tokens
         if waste is None and self._system_prompts:
             waste = "repeated system prompt"
@@ -128,11 +138,13 @@ class ContextDiffEngine:
 
 
 class LLMTracker:
-    def __init__(self):
-        self._session_id=None
+    def __init__(self, agent_id: str = "default"):
+        self.agent_id = agent_id
+        self.session_id = None
         self.state = TrackerState()
         self.diff = ContextDiffEngine()
         self.healer = SelfHealingEngine()
+
 
     def start(self) -> None:
         with self.state._lock:
@@ -331,18 +343,56 @@ class LLMTracker:
 
         reused, waste = self.diff.analyze(messages)
 
+        # --- NEW: actually run compression to get real token savings ---
+        from .compressor import compress_messages
+        _, orig_tok, comp_tok = compress_messages(messages)
+        compression_savings = max(0, orig_tok - comp_tok)
+        context_savings_tokens = compression_savings + reused
+
         # Try LLM call — self-heal on failure
+        call_failed = False
+        call_healed = False
+        call_error_message: Optional[str] = None
         try:
             response = fn()
             self.healer.record_success(messages, response)
         except Exception as e:
+            call_failed = True
+            call_error_message = str(e)[:500]  # keep it bounded
             self.healer.record_failure()
             if self.healer.can_heal():
+                call_healed = True
                 recovery_msgs = self.healer.get_recovery_messages(messages)
                 with self.state._lock:
                     self.state._last_messages = recovery_msgs
-                raise
+
+            # Persist the failure itself before re-raising, so the
+            # Attribution Engine has a record to analyze.
+            failure_record = CallRecord(
+                provider=provider,
+                model=model,
+                input_tokens=0,
+                output_tokens=0,
+                cost=0.0,
+                reused_tokens=0,
+                waste_category=None,
+                messages=messages,
+                failed=call_failed,
+                healed=call_healed,
+                error_message=call_error_message,
+            )
+            self._persist(failure_record)
+            with self.state._lock:
+                self.state.call_count += 1
+                self.state.step_counter += 1
+                self.state._last_messages = list(messages)
+                step = self.state.step_counter
+            if self.state.session_id is not None:
+                self.state.storage.save_checkpoint(
+                    self.state.session_id, step, messages
+                )
             raise
+      
 
         input_tokens, output_tokens = self._extract_usage(
             response, provider, messages, kwargs
@@ -355,9 +405,12 @@ class LLMTracker:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost=cost,
-            reused_tokens=reused,
+            reused_tokens=context_savings_tokens,
             waste_category=waste,
             messages=messages,
+            failed=call_failed,
+            healed=call_healed,
+            error_message=call_error_message,
         )
         self._persist(record)
 
@@ -398,6 +451,9 @@ class LLMTracker:
             reused_tokens=record.reused_tokens,
             waste_category=record.waste_category,
             messages=record.messages,
+            failed=record.failed,
+            healed=record.healed,
+            error_message=record.error_message,
         )
 
     def _extract_usage(
@@ -447,11 +503,42 @@ class LLMTracker:
         return input_tokens, output_tokens
 
 
-_tracker = LLMTracker()
+_trackers: dict[str, "LLMTracker"] = {}
+_trackers_lock = threading.Lock()
+
+DEFAULT_AGENT_ID = "default"
 
 
-def get_tracker() -> LLMTracker:
-    return _tracker
+def get_tracker(agent_id: str | None = None) -> "LLMTracker":
+    """
+    Return the LLMTracker for a given agent_id.
+
+    Each distinct agent_id gets its own isolated LLMTracker instance,
+    so multiple agents running in the same process don't mix contexts,
+    sessions, or checkpoints.
+
+    Calling get_tracker() with no agent_id returns the default tracker
+    (fully backward-compatible with single-agent usage).
+    """
+    key = agent_id or DEFAULT_AGENT_ID
+    with _trackers_lock:
+        if key not in _trackers:
+            _trackers[key] = LLMTracker(agent_id=key)
+        return _trackers[key]
+
+
+def list_active_agents() -> list[str]:
+    """Return agent_ids of all trackers currently active (started)."""
+    with _trackers_lock:
+        return [aid for aid, t in _trackers.items() if t.state.active]
+
+
+
+
+
+  
+
+
 
 
 

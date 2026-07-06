@@ -154,3 +154,17 @@ def context_diff(
     return _differ.diff(messages_a, messages_b, step_a, step_b)
 
 
+
+
+def attribute_session(session_id: int) -> list:
+    from .attribution import get_attribution_engine
+    return get_attribution_engine().attribute_session(session_id)
+
+
+def replay(session_id: int, from_step: int, with_context=None, dry_run: bool = True, llm_fn=None, replace_step: bool = False):
+    from .replay import CounterfactualReplayer
+    return CounterfactualReplayer().replay(session_id, from_step, with_context=with_context, dry_run=dry_run, llm_fn=llm_fn, replace_step=replace_step)
+
+def list_checkpoints(session_id: int) -> list:
+    from .replay import CounterfactualReplayer
+    return CounterfactualReplayer().list_checkpoints(session_id)

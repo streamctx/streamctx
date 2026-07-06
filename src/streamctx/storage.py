@@ -50,8 +50,12 @@ class SessionStorage:
                         reused_tokens INTEGER DEFAULT 0,
                         waste_category TEXT,
                         messages_json TEXT,
+                        failed INTEGER DEFAULT 0,
+                        healed INTEGER DEFAULT 0,
+                        error_message TEXT,
                         FOREIGN KEY (session_id) REFERENCES sessions(id)
-                    );
+);
+                    
                     CREATE TABLE IF NOT EXISTS checkpoints (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         session_id INTEGER NOT NULL,
@@ -68,7 +72,7 @@ class SessionStorage:
         with self._lock:
             with self._connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO sessions (started_at) VALUES (?)", (now,),
+                    "INSERT INTO sessions (started_at) VALUES (?)", (now,)
                 )
                 conn.commit()
                 return int(cur.lastrowid)
@@ -83,6 +87,7 @@ class SessionStorage:
                 )
                 conn.commit()
 
+    
     def record_call(
         self,
         session_id: int,
@@ -94,25 +99,31 @@ class SessionStorage:
         reused_tokens: int,
         waste_category: Optional[str],
         messages: list[dict[str, Any]],
+        failed: bool = False,
+        healed: bool = False,
+        error_message: Optional[str] = None,
     ) -> None:
+
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._connect() as conn:
                 conn.execute(
-                    """
-                    INSERT INTO calls (
-                        session_id, timestamp, provider, model,
-                        input_tokens, output_tokens, cost,
-                        reused_tokens, waste_category, messages_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        session_id, now, provider, model,
-                        input_tokens, output_tokens, cost,
-                        reused_tokens, waste_category,
-                        json.dumps(messages),
-                    ),
-                )
+                     """
+                     INSERT INTO calls (
+                         session_id, timestamp, provider, model,
+                         input_tokens, output_tokens, cost,
+                         reused_tokens, waste_category, messages_json,
+                         failed, healed, error_message
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         session_id, now, provider, model,
+                         input_tokens, output_tokens, cost,
+                         reused_tokens, waste_category,
+                         json.dumps(messages),
+                         int(failed), int(healed), error_message,
+                     ),
+                 )
                 conn.commit()
 
     def save_checkpoint(
@@ -147,13 +158,13 @@ class SessionStorage:
                     """,
                     (session_id,),
                 ).fetchone()
-        if row is None:
-            return None
-        return {
-            "step_number": row["step_number"],
-            "messages": json.loads(row["messages_json"]),
-            "timestamp": row["timestamp"],
-        }
+            if row is None:
+                return None
+            return {
+                "step_number": row["step_number"],
+                "messages": json.loads(row["messages_json"]),
+                "timestamp": row["timestamp"],
+            }
 
     def resume_from_checkpoint(self, session_id: int) -> list[dict[str, Any]]:
         """Return messages from the latest checkpoint to resume from."""
@@ -172,10 +183,10 @@ class SessionStorage:
                         COALESCE(SUM(input_tokens), 0) AS input_tokens,
                         COALESCE(SUM(output_tokens), 0) AS output_tokens,
                         COALESCE(SUM(cost), 0) AS total_cost,
-                        COALESCE(SUM(reused_tokens), 0) AS reused_tokens
+                        COALESCE(SUM(reused_tokens), 0) AS reused_tokens, (SELECT model FROM calls WHERE session_id = ? ORDER BY rowid DESC LIMIT 1) AS model
                     FROM calls WHERE session_id = ?
                     """,
-                    (session_id,),
+                    (session_id, session_id),
                 ).fetchone()
                 waste_rows = conn.execute(
                     """
@@ -197,11 +208,33 @@ class SessionStorage:
             "biggest_waste": waste_rows["waste_category"] if waste_rows else None,
         }
 
+    def get_calls_for_session(self, session_id: int) -> list[dict[str, Any]]:
+            """Return every call row for a session, oldest first.
+
+            Used by the Causal Failure Attribution Engine to walk through a
+            session's calls in chronological order and score candidate root
+            causes for any failed call.
+            """
+            with self._lock:
+                with self._connect() as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT id, session_id, timestamp, provider, model,
+                               input_tokens, output_tokens, cost,
+                               reused_tokens, waste_category, messages_json,
+                               failed, healed, error_message
+                        FROM calls
+                        WHERE session_id = ?
+                        ORDER BY id ASC
+                        """,
+                        (session_id,),
+                    ).fetchall()
+            return [dict(row) for row in rows]
 
 
 def get_storage() -> "SessionStorage":
     """
-    Factory function — STREAMCTX_BACKEND env var check kare ane
+    Factory function - STREAMCTX_BACKEND env var check kare ane
     sachu storage backend return kare (sqlite athva supabase).
     """
     backend = os.environ.get("STREAMCTX_BACKEND", "sqlite").lower()
