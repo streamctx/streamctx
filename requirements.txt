@@ -2,3 +2,4 @@ rich==13.7.0
 supabase
 httpx
 openai
+python-dotenv
