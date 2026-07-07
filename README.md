@@ -1,3 +1,4 @@
+<img width="1924" height="1024" alt="Animation6" src="https://github.com/user-attachments/assets/6fce08b9-775e-4477-b2f9-f107def8632e" />
 **Your AI agent is silently corrupting its own context. StreamCtx detects it — and fixes it.**
 
 [![PyPI](https://img.shields.io/pypi/v/streamctx)](https://pypi.org/project/streamctx/)
