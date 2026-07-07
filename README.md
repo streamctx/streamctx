@@ -1,11 +1,12 @@
-# StreamCtx 
-![StreamCtx Demo](assets/demo.gif)
-
 **Your AI agent is silently corrupting its own context. StreamCtx detects it — and fixes it.**
 
 [![PyPI](https://img.shields.io/pypi/v/streamctx)](https://pypi.org/project/streamctx/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Free Forever](https://img.shields.io/badge/core-free%20forever-blue)]()
+
+Every AI agent framework tells you *how many tokens* you used. None of them tell you *why your agent is broken*.
+
+StreamCtx is a **Context Nervous System** for AI agents — a lightweight Python SDK that sits between your app and any LLM API, watching every message for signs of trouble: poisoned context, silent drift, runaway loops, and failures that trace back to something that happened 10 steps ago.
 
 ## Install
 
@@ -31,8 +32,9 @@ Then in production:
 - Context from step 3 contradicts context from step 7
 - Agent hallucinates a tool call, writes it to memory, references it forever
 - Your $0.50 task costs $50 because nobody set a limit
+- A call fails at step 12 — but the *real* cause was a bad compression at step 4, and you have no way to know that
 
-Every LLM observability tool tracks tokens. Nobody tracks context health.
+Every LLM observability tool tracks tokens. Nobody tracks context health, and nobody tells you *which* earlier call actually caused a later failure.
 
 Until now.
 
@@ -46,8 +48,8 @@ Until now.
 result = streamctx.scan(messages)
 print(result["health_score"])   # 25/100
 print(result["warnings"])
-# ⚠️  Repeated errors: 'failed' 4x — agent stuck in loop
-# 🔴  Context severely poisoned — resume from checkpoint
+#  ⚠️  Repeated errors: 'failed' 4x — agent stuck in loop
+#  🔴  Context severely poisoned — resume from checkpoint
 ```
 
 ### 2. Context Diff — See Exactly What Changed
@@ -55,8 +57,8 @@ print(result["warnings"])
 ```python
 diff = streamctx.context_diff(step3_msgs, step7_msgs, step_a=3, step_b=7)
 print(diff["summary"])
-# ⚠️  System prompt REMOVED — agent lost instructions
-# ⚠️  Contradiction: 'use gpt' added but 'use claude' removed
+#  ⚠️  System prompt REMOVED — agent lost instructions
+#  ⚠️  Contradiction: 'use gpt' added but 'use claude' removed
 # Drift Score: 50/100
 ```
 
@@ -68,11 +70,11 @@ messages = streamctx.resume(session_id)
 # Pick up exactly where agent left off
 ```
 
-### 4. 50% Token Compression
+### 4. 30–60% Token Compression
 
 ```python
 result = streamctx.compress(messages, max_tokens=2000)
-# 140 tokens → 70 tokens (50% reduction)
+# 140 tokens → 65-95 tokens depending on redundancy (30-60% reduction)
 ```
 
 ### 5. Self-Healing
@@ -82,7 +84,29 @@ stats = streamctx.healing_stats()
 # failures: 1, recoveries: 1
 ```
 
-### 6. Full Session Report
+### 6. Causal Failure Attribution — "Why Did This Actually Break?"
+
+Most tools show you the call that failed. StreamCtx traces back through the session and tells you which *earlier* call actually caused it — even if that call succeeded at the time.
+
+```python
+attribution = streamctx.attribute_failure(session_id, failed_call_id)
+print(attribution["root_cause_call_id"])   # call from 8 steps earlier
+print(attribution["confidence"])            # 0.82
+print(attribution["reason"])
+# Heavy compression + reused context at step 4 degraded signal
+```
+
+### 7. Counterfactual Replay — "What If This Call Had Been Different?"
+
+Rewind to any checkpoint, change one message, and replay forward to see if the outcome changes — without touching your live session.
+
+```python
+result = streamctx.replay(session_id, checkpoint_id, modified_message, dry_run=True)
+print(result["diverges_at_step"])
+print(result["new_outcome"])
+```
+
+### 8. Full Session Report
 
 ```python
 streamctx.report()
@@ -93,9 +117,9 @@ streamctx.stop()
 
 ## Storage Backends
 
-StreamCtx works out of the box with **zero config** (SQLite, local file). For production, point it at **Supabase** for managed, multi-user persistence:
+StreamCtx works out of the box with zero config (SQLite, local file). For production, point it at Supabase for managed, multi-user persistence:
 
-```bash
+```
 # .env
 STREAMCTX_BACKEND=supabase
 SUPABASE_URL=your-project-url
@@ -108,20 +132,23 @@ No code changes needed — same API, different backend.
 
 ## Feature Comparison
 
+| Feature                       | StreamCtx | Langfuse | LangSmith  | Helicone |
+| ---------------------------   | --------- | -------- | ---------  | -------- |
+| Token tracking                | YES       | YES      | YES        | YES      |
+| Cost estimation               | YES       | YES      | YES        | YES      |
+| Context Poison Detection      | YES       | NO       | NO         | NO       |
+| Context Diff                  | YES       | NO       | NO         | NO       |
+| Auto-checkpoint               | YES       | NO       | NO         | NO       |
+| 30-60% Compression            | YES       | NO       | NO         | NO       |
+| Self-healing                  | YES       | NO       | NO         | NO       |
+| Causal Failure Attribution    | YES       | NO       | NO         | NO       |
+| Counterfactual Replay         | YES       | NO       | NO         | NO       |
+| Zero config                   | YES       | NO       | NO         | NO       |
+| Open source                   | YES       | YES      | NO         | YES      |
+| Core features free forever    | YES       | Partial  | NO         | Partial  |
 
-Feature              | StreamCtx | Langfuse | LangSmith | Mem0
----------------------|-----------|----------|-----------|-----
-Token tracking       |     YES   |    YES   |    YES    |  NO
-Cost estimation      |     YES   |    YES   |    YES    |  NO
-Context Poison Det.  |     YES   |    NO    |    NO     |  NO
-Context Diff         |     YES   |    NO    |    NO     |  NO
-Auto-checkpoint      |     YES   |    NO    |    NO     |  NO
-50% Compression      |     YES   |    NO    |    NO     |  NO
-Self-healing         |     YES   |    NO    |    NO     |  NO
-Zero config          |     YES   |    NO    |    NO     |  NO
-Open source          |     YES   |    YES   |    NO     |  NO
 
-| **Core features free forever** | **YES** | Partial | NO | NO (Graph Memory paywalled) |
+| Core features free forever | YES | Partial | NO | Partial |
 
 ---
 
@@ -152,21 +179,24 @@ streamctx.stop()
 
 ## API Reference
 
-```python
-streamctx.start()                        # start tracking
-streamctx.stop()                         # stop tracking
-streamctx.report()                       # print full report
-streamctx.wrap(client)                   # manually wrap client
+```
+streamctx.start()                                   # start tracking
+streamctx.stop()                                    # stop tracking
+streamctx.report()                                  # print full report
+streamctx.wrap(client)                              # manually wrap client
 
-streamctx.scan(messages)                 # context health score
-streamctx.context_diff(a, b)             # compare two steps
+streamctx.scan(messages)                            # context health score
+streamctx.context_diff(a, b)                        # compare two steps
 
-streamctx.checkpoint()                   # save checkpoint
-streamctx.resume(session_id)             # resume from checkpoint
-streamctx.get_session_id()               # current session ID
+streamctx.checkpoint()                              # save checkpoint
+streamctx.resume(session_id)                        # resume from checkpoint
+streamctx.get_session_id()                          # current session ID
 
-streamctx.compress(messages)             # 50% token compression
-streamctx.healing_stats()                # self-healing stats
+streamctx.compress(messages)                        # 30-60% token compression
+streamctx.healing_stats()                           # self-healing stats
+
+streamctx.attribute_failure(session_id, call_id)    # trace root cause of a failure
+streamctx.replay(session_id, checkpoint_id, msg)    # counterfactual replay
 ```
 
 ---
@@ -175,13 +205,13 @@ streamctx.healing_stats()                # self-healing stats
 
 Most tools answer: "How many tokens did I use?"
 
-StreamCtx answers: "Why is my agent broken — and how do I fix it?"
+StreamCtx answers: "Why is my agent broken, what caused it, and how do I fix it?"
 
 ---
 
 ## Pricing
 
-The core SDK — all 6 features above, plus the SQLite backend — is **free forever**, MIT-licensed, with no feature gates. No credit card, no signup, no locked features.
+The core SDK — all 8 features above, plus the SQLite backend — is free forever, MIT-licensed, with no feature gates. No credit card, no signup, no locked features.
 
 A managed offering (hosted Supabase backend + observability dashboard + team access) is planned for teams who want infrastructure handled for them. The features themselves will never move behind a paywall.
 
@@ -194,14 +224,13 @@ A managed offering (hosted Supabase backend + observability dashboard + team acc
 - Context poison detection
 - Context diff + drift scoring
 - Auto-checkpoint + resume
-- 50% token compression
+- 30-60% token compression
 - Self-healing engine
+- Causal failure attribution
+- Counterfactual replay engine
 - Supabase storage backend
 
-**Coming:**
-- Context budget manager (v0.4.0)
-- Visual dashboard
-- Multi-agent support
+Actively building the next layer — details soon.
 
 ---
 
