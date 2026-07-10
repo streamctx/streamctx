@@ -215,8 +215,6 @@ No code changes needed — same API, different backend.
 | Core features free forever    | YES       | Partial  | NO         | Partial  |
 
 
-| Core features free forever | YES | Partial | NO | Partial |
-
 ---
 
 ## Why StreamCtx?
