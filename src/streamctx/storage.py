@@ -1,4 +1,4 @@
-"""SQLite storage for streamctx sessions and checkpoints."""
+﻿"""SQLite storage for streamctx sessions and checkpoints."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -21,6 +22,7 @@ class SessionStorage:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = db_path or _default_db_path()
         self._lock = threading.Lock()
+        self._conn = self._connect()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -28,70 +30,79 @@ class SessionStorage:
             str(self.db_path), check_same_thread=False, timeout=30.0
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
+        for attempt in range(5):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
         return conn
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
     def _init_db(self) -> None:
         with self._lock:
-            with self._connect() as conn:
-                conn.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        started_at TEXT NOT NULL,
-                        ended_at TEXT
-                    );
-                    CREATE TABLE IF NOT EXISTS calls (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id INTEGER NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        provider TEXT NOT NULL,
-                        model TEXT,
-                        input_tokens INTEGER DEFAULT 0,
-                        output_tokens INTEGER DEFAULT 0,
-                        cost REAL DEFAULT 0,
-                        reused_tokens INTEGER DEFAULT 0,
-                        waste_category TEXT,
-                        messages_json TEXT,
-                        failed INTEGER DEFAULT 0,
-                        healed INTEGER DEFAULT 0,
-                        error_message TEXT,
-                        FOREIGN KEY (session_id) REFERENCES sessions(id)
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    cost REAL DEFAULT 0,
+                    reused_tokens INTEGER DEFAULT 0,
+                    waste_category TEXT,
+                    messages_json TEXT,
+                    failed INTEGER DEFAULT 0,
+                    healed INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
-                    
-                    CREATE TABLE IF NOT EXISTS checkpoints (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id INTEGER NOT NULL,
-                        step_number INTEGER NOT NULL,
-                        messages_json TEXT NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        FOREIGN KEY (session_id) REFERENCES sessions(id)
-                    );
-                    """
-                )
+
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    step_number INTEGER NOT NULL,
+                    messages_json TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                );
+                """
+            )
+            self._conn.commit()
 
     def start_session(self) -> int:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            with self._connect() as conn:
-                cur = conn.execute(
-                    "INSERT INTO sessions (started_at) VALUES (?)", (now,)
-                )
-                conn.commit()
-                return int(cur.lastrowid)
+            cur = self._conn.execute(
+                "INSERT INTO sessions (started_at) VALUES (?)", (now,)
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
 
     def end_session(self, session_id: int) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                    "UPDATE sessions SET ended_at = ? WHERE id = ?",
-                    (now, session_id),
-                )
-                conn.commit()
+            self._conn.execute(
+                "UPDATE sessions SET ended_at = ? WHERE id = ?",
+                (now, session_id),
+            )
+            self._conn.commit()
 
-    
+
     def record_call(
         self,
         session_id: int,
@@ -110,25 +121,24 @@ class SessionStorage:
 
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                     """
-                     INSERT INTO calls (
-                         session_id, timestamp, provider, model,
-                         input_tokens, output_tokens, cost,
-                         reused_tokens, waste_category, messages_json,
-                         failed, healed, error_message
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                     """,
-                     (
-                         session_id, now, provider, model,
-                         input_tokens, output_tokens, cost,
-                         reused_tokens, waste_category,
-                         json.dumps(messages),
-                         int(failed), int(healed), error_message,
-                     ),
-                 )
-                conn.commit()
+            self._conn.execute(
+                 """
+                 INSERT INTO calls (
+                     session_id, timestamp, provider, model,
+                     input_tokens, output_tokens, cost,
+                     reused_tokens, waste_category, messages_json,
+                     failed, healed, error_message
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 """,
+                 (
+                     session_id, now, provider, model,
+                     input_tokens, output_tokens, cost,
+                     reused_tokens, waste_category,
+                     json.dumps(messages),
+                     int(failed), int(healed), error_message,
+                 ),
+             )
+            self._conn.commit()
 
     def save_checkpoint(
         self,
@@ -139,36 +149,34 @@ class SessionStorage:
         """Save current messages as a checkpoint after each LLM call."""
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO checkpoints (session_id, step_number, messages_json, timestamp)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (session_id, step_number, json.dumps(messages), now),
-                )
-                conn.commit()
+            self._conn.execute(
+                """
+                INSERT INTO checkpoints (session_id, step_number, messages_json, timestamp)
+                VALUES (?, ?, ?, ?)
+                """,
+                (session_id, step_number, json.dumps(messages), now),
+            )
+            self._conn.commit()
 
     def get_latest_checkpoint(self, session_id: int) -> Optional[dict[str, Any]]:
         """Get the most recent checkpoint for a session."""
         with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    """
-                    SELECT step_number, messages_json, timestamp
-                    FROM checkpoints
-                    WHERE session_id = ?
-                    ORDER BY step_number DESC LIMIT 1
-                    """,
-                    (session_id,),
-                ).fetchone()
-            if row is None:
-                return None
-            return {
-                "step_number": row["step_number"],
-                "messages": json.loads(row["messages_json"]),
-                "timestamp": row["timestamp"],
-            }
+            row = self._conn.execute(
+                """
+                SELECT step_number, messages_json, timestamp
+                FROM checkpoints
+                WHERE session_id = ?
+                ORDER BY step_number DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "step_number": row["step_number"],
+            "messages": json.loads(row["messages_json"]),
+            "timestamp": row["timestamp"],
+        }
 
     def resume_from_checkpoint(self, session_id: int) -> list[dict[str, Any]]:
         """Return messages from the latest checkpoint to resume from."""
@@ -179,29 +187,28 @@ class SessionStorage:
 
     def get_session_stats(self, session_id: int) -> dict[str, Any]:
         with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS call_count,
-                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
-                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
-                        COALESCE(SUM(cost), 0) AS total_cost,
-                        COALESCE(SUM(reused_tokens), 0) AS reused_tokens, (SELECT model FROM calls WHERE session_id = ? ORDER BY rowid DESC LIMIT 1) AS model
-                    FROM calls WHERE session_id = ?
-                    """,
-                    (session_id, session_id),
-                ).fetchone()
-                waste_rows = conn.execute(
-                    """
-                    SELECT waste_category, COUNT(*) AS cnt
-                    FROM calls
-                    WHERE session_id = ? AND waste_category IS NOT NULL
-                    GROUP BY waste_category
-                    ORDER BY cnt DESC LIMIT 1
-                    """,
-                    (session_id,),
-                ).fetchone()
+            row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS call_count,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(cost), 0) AS total_cost,
+                    COALESCE(SUM(reused_tokens), 0) AS reused_tokens, (SELECT model FROM calls WHERE session_id = ? ORDER BY rowid DESC LIMIT 1) AS model
+                FROM calls WHERE session_id = ?
+                """,
+                (session_id, session_id),
+            ).fetchone()
+            waste_rows = self._conn.execute(
+                """
+                SELECT waste_category, COUNT(*) AS cnt
+                FROM calls
+                WHERE session_id = ? AND waste_category IS NOT NULL
+                GROUP BY waste_category
+                ORDER BY cnt DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
         return {
             "call_count": int(row["call_count"]),
             "input_tokens": int(row["input_tokens"]),
@@ -220,20 +227,23 @@ class SessionStorage:
             causes for any failed call.
             """
             with self._lock:
-                with self._connect() as conn:
-                    rows = conn.execute(
-                        """
-                        SELECT id, session_id, timestamp, provider, model,
-                               input_tokens, output_tokens, cost,
-                               reused_tokens, waste_category, messages_json,
-                               failed, healed, error_message
-                        FROM calls
-                        WHERE session_id = ?
-                        ORDER BY id ASC
-                        """,
-                        (session_id,),
-                    ).fetchall()
+                rows = self._conn.execute(
+                    """
+                    SELECT id, session_id, timestamp, provider, model,
+                           input_tokens, output_tokens, cost,
+                           reused_tokens, waste_category, messages_json,
+                           failed, healed, error_message
+                    FROM calls
+                    WHERE session_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
             return [dict(row) for row in rows]
+
+
+_storage_cache: dict[str, "SessionStorage"] = {}
+_storage_cache_lock = threading.Lock()
 
 
 def get_storage() -> "SessionStorage":
@@ -247,4 +257,8 @@ def get_storage() -> "SessionStorage":
         from streamctx.supabase_storage import SupabaseStorage
         return SupabaseStorage()
 
-    return SessionStorage()
+    db_path = str(_default_db_path())
+    with _storage_cache_lock:
+        if db_path not in _storage_cache:
+            _storage_cache[db_path] = SessionStorage()
+        return _storage_cache[db_path]
