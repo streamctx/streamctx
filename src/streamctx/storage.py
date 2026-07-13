@@ -240,7 +240,7 @@ def get_storage() -> "SessionStorage":
     backend = os.environ.get("STREAMCTX_BACKEND", "sqlite").lower()
 
     if backend == "supabase":
-        from src.streamctx.supabase_storage import SupabaseStorage
+        from streamctx.supabase_storage import SupabaseStorage
         return SupabaseStorage()
 
     return SessionStorage()

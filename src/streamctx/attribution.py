@@ -164,16 +164,29 @@ class AttributionEngine:
         rows = self.storage.get_calls_for_session(session_id)
         return [_row_to_snapshot(r) for r in rows]
 
-    def attribute_failure(self, session_id: int, failed_call_id: int) -> AttributionResult:
+    def attribute_failure(
+        self,
+        session_id: int,
+        failed_call_id: int,
+        calls: Optional[list[CallSnapshot]] = None,
+        ) -> AttributionResult:
         """Attribute a single failed call to its most likely root-cause step.
 
         Walks backwards from the failed call (inclusive) up to `self.lookback`
         prior calls in the same session, scores each as a candidate, and
         returns the highest-scoring one.
+
+        If `calls` is provided (pre-loaded session calls), it's reused instead
+        of re-querying storage — used by `attribute_session()` to avoid an
+        N+1 query pattern when attributing multiple failures in one session.
         """
-        calls = self._load_session_calls(session_id)
+
+        if calls is None:
+            calls = self._load_session_calls(session_id)
         index_by_id = {c.id: i for i, c in enumerate(calls)}
 
+    
+    
         if failed_call_id not in index_by_id:
             return AttributionResult(
                 session_id=session_id,
@@ -240,8 +253,9 @@ class AttributionEngine:
         results: list[AttributionResult] = []
         for call in calls:
             if call.failed:
-                results.append(self.attribute_failure(session_id, call.id))
+                results.append(self.attribute_failure(session_id, call.id, calls=calls))
         return results
+    
 
     @staticmethod
     def _explain(

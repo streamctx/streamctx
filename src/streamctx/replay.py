@@ -155,7 +155,10 @@ class CounterfactualReplayer:
             )
 
         # 1. Load the checkpoint at from_step
-        original_messages = self._load_checkpoint_at_step(session_id, from_step)
+        
+        _rows = self._get_all_checkpoint_rows(session_id)
+        original_messages = self._load_checkpoint_at_step(session_id, from_step, rows=_rows)
+
         if not original_messages:
             return ReplayResult(
                 session_id=session_id,
@@ -190,7 +193,7 @@ class CounterfactualReplayer:
         conversation = list(counterfactual_messages)
 
         # Load all checkpoints for this session to know how many steps to replay
-        all_steps = self._get_all_steps(session_id)
+        all_steps = self._get_all_steps(session_id, rows=_rows)
         steps_after = [s for s in all_steps if s > from_step]
         synthetic_step = not steps_after
         
@@ -279,10 +282,11 @@ class CounterfactualReplayer:
     # ------------------------------------------------------------------
 
     def _load_checkpoint_at_step(
-        self, session_id: int, step_number: int
+        self, session_id: int, step_number: int, rows: Optional[list[dict[str, Any]]] = None
     ) -> list[dict[str, Any]]:
         """Load messages from the checkpoint at a specific step number."""
-        rows = self._get_all_checkpoint_rows(session_id)
+        if rows is None:
+            rows = self._get_all_checkpoint_rows(session_id)
         for row in rows:
             if row["step_number"] == step_number:
                 try:
@@ -317,11 +321,15 @@ class CounterfactualReplayer:
         except Exception:
             return []
 
-    def _get_all_steps(self, session_id: int) -> list[int]:
+    def _get_all_steps(
+        self, session_id: int, rows: Optional[list[dict[str, Any]]] = None
+    ) -> list[int]:
         """Return sorted list of step numbers available for a session."""
-        rows = self._get_all_checkpoint_rows(session_id)
+        if rows is None:
+            rows = self._get_all_checkpoint_rows(session_id)
         return sorted(r["step_number"] for r in rows)
 
+   
     def _inject_context(
         self,
         original_messages: list[dict[str, Any]],
