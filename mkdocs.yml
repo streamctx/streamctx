@@ -1,0 +1,49 @@
+
+site_name: StreamCtx
+site_description: Context Nervous System for AI Agents
+site_url: https://streamctx.github.io/streamctx/
+repo_url: https://github.com/streamctx/streamctx
+repo_name: streamctx/streamctx
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Core Concepts:
+      - Attribution Engine: concepts/attribution.md
+      - Checkpoint & Resume: concepts/checkpoint-resume.md
+      - Poison Detector: concepts/poison-detector.md
+      - Context Compression: concepts/compression.md
+  - API Reference: api-reference.md
+  - Examples: examples.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
