@@ -93,11 +93,17 @@ stats = streamctx.healing_stats()
 Most tools show you the call that failed. StreamCtx traces back through the session and tells you which *earlier* call actually caused it — even if that call succeeded at the time.
 
 ```python
-attribution = streamctx.attribute_failure(session_id, failed_call_id)
-print(attribution["root_cause_call_id"])   # call from 8 steps earlier
-print(attribution["confidence"])           # 0.82
-print(attribution["reason"])
-# Heavy compression + reused context at step 4 degraded signal
+
+from streamctx.attribution import get_attribution_engine
+
+engine = get_attribution_engine()
+results = engine.attribute_session(session_id)
+attribution = results[0]  # highest-confidence root cause
+
+print(attribution.root_cause_call_id)   # call from earlier in the session
+print(attribution.confidence)            # e.g. 0.82
+print(attribution.reason)
+# e.g. "Heavy compression + reused context degraded signal"
 ```
 
 ### 7. Counterfactual Replay — "What If This Call Had Been Different?"
@@ -168,7 +174,7 @@ streamctx.stop()
 streamctx.start()                                        # start tracking
 streamctx.stop()                                          # stop tracking
 streamctx.report()                                        # print full report
-streamctx.wrap(client)                                    # manually wrap client
+streamctx.wrap(client)                                    # patches client in-place; keep using the same 'client' object afterward
 
 streamctx.scan(messages)                                  # context health score
 streamctx.context_diff(a, b)                              # compare two steps
@@ -180,7 +186,7 @@ streamctx.get_session_id()                                # current session ID
 streamctx.compress(messages)                               # 30-60% token compression
 streamctx.healing_stats()                                  # self-healing stats
 
-streamctx.attribute_failure(session_id, call_id)           # trace root cause of a failure
+get_attribution_engine().attribute_session(session_id)           # trace root cause of a failure
 streamctx.replay(session_id, checkpoint_id, msg)            # counterfactual replay
 ```
 
