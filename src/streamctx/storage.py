@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sqlite3
 import threading
 import time
@@ -19,11 +20,14 @@ def _default_db_path() -> Path:
 
 
 class SessionStorage:
-    def __init__(self, db_path: Optional[Path] = None) -> None:
+    def __init__(self, db_path: Optional[Path] = None, read_pool_size: int = 8) -> None:
         self.db_path = db_path or _default_db_path()
-        self._lock = threading.Lock()
-        self._conn = self._connect()
+        self._write_lock = threading.Lock()
+        self._write_conn = self._connect()
         self._init_db()
+        self._read_pool: "queue.Queue[sqlite3.Connection]" = queue.Queue()
+        for _ in range(read_pool_size):
+            self._read_pool.put(self._connect())
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -41,13 +45,21 @@ class SessionStorage:
                 time.sleep(0.2 * (attempt + 1))
         return conn
 
+    def _borrow_read_conn(self) -> sqlite3.Connection:
+        return self._read_pool.get()
+
+    def _return_read_conn(self, conn: sqlite3.Connection) -> None:
+        self._read_pool.put(conn)
+
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        with self._write_lock:
+            self._write_conn.close()
+        while not self._read_pool.empty():
+            self._read_pool.get_nowait().close()
 
     def _init_db(self) -> None:
-        with self._lock:
-            self._conn.executescript(
+        with self._write_lock:
+            self._write_conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,27 +92,32 @@ class SessionStorage:
                     timestamp TEXT NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_calls_session_id
+                    ON calls(session_id);
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_session_id
+                    ON checkpoints(session_id);
                 """
             )
-            self._conn.commit()
+            self._write_conn.commit()
 
     def start_session(self) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            cur = self._conn.execute(
+        with self._write_lock:
+            cur = self._write_conn.execute(
                 "INSERT INTO sessions (started_at) VALUES (?)", (now,)
             )
-            self._conn.commit()
+            self._write_conn.commit()
             return int(cur.lastrowid)
 
     def end_session(self, session_id: int) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            self._conn.execute(
+        with self._write_lock:
+            self._write_conn.execute(
                 "UPDATE sessions SET ended_at = ? WHERE id = ?",
                 (now, session_id),
             )
-            self._conn.commit()
+            self._write_conn.commit()
 
 
     def record_call(
@@ -120,8 +137,8 @@ class SessionStorage:
     ) -> None:
 
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            self._conn.execute(
+        with self._write_lock:
+            self._write_conn.execute(
                  """
                  INSERT INTO calls (
                      session_id, timestamp, provider, model,
@@ -138,7 +155,7 @@ class SessionStorage:
                      int(failed), int(healed), error_message,
                  ),
              )
-            self._conn.commit()
+            self._write_conn.commit()
 
     def save_checkpoint(
         self,
@@ -148,20 +165,21 @@ class SessionStorage:
     ) -> None:
         """Save current messages as a checkpoint after each LLM call."""
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            self._conn.execute(
+        with self._write_lock:
+            self._write_conn.execute(
                 """
                 INSERT INTO checkpoints (session_id, step_number, messages_json, timestamp)
                 VALUES (?, ?, ?, ?)
                 """,
                 (session_id, step_number, json.dumps(messages), now),
             )
-            self._conn.commit()
+            self._write_conn.commit()
 
     def get_latest_checkpoint(self, session_id: int) -> Optional[dict[str, Any]]:
         """Get the most recent checkpoint for a session."""
-        with self._lock:
-            row = self._conn.execute(
+        conn = self._borrow_read_conn()
+        try:
+            row = conn.execute(
                 """
                 SELECT step_number, messages_json, timestamp
                 FROM checkpoints
@@ -170,6 +188,8 @@ class SessionStorage:
                 """,
                 (session_id,),
             ).fetchone()
+        finally:
+            self._return_read_conn(conn)
         if row is None:
             return None
         return {
@@ -186,8 +206,9 @@ class SessionStorage:
         return result["messages"]
 
     def get_session_stats(self, session_id: int) -> dict[str, Any]:
-        with self._lock:
-            row = self._conn.execute(
+        conn = self._borrow_read_conn()
+        try:
+            row = conn.execute(
                 """
                 SELECT
                     COUNT(*) AS call_count,
@@ -199,7 +220,7 @@ class SessionStorage:
                 """,
                 (session_id, session_id),
             ).fetchone()
-            waste_rows = self._conn.execute(
+            waste_rows = conn.execute(
                 """
                 SELECT waste_category, COUNT(*) AS cnt
                 FROM calls
@@ -209,6 +230,8 @@ class SessionStorage:
                 """,
                 (session_id,),
             ).fetchone()
+        finally:
+            self._return_read_conn(conn)
         return {
             "call_count": int(row["call_count"]),
             "input_tokens": int(row["input_tokens"]),
@@ -226,8 +249,9 @@ class SessionStorage:
             session's calls in chronological order and score candidate root
             causes for any failed call.
             """
-            with self._lock:
-                rows = self._conn.execute(
+            conn = self._borrow_read_conn()
+            try:
+                rows = conn.execute(
                     """
                     SELECT id, session_id, timestamp, provider, model,
                            input_tokens, output_tokens, cost,
@@ -239,6 +263,8 @@ class SessionStorage:
                     """,
                     (session_id,),
                 ).fetchall()
+            finally:
+                self._return_read_conn(conn)
             return [dict(row) for row in rows]
 
 
@@ -262,3 +288,4 @@ def get_storage() -> "SessionStorage":
         if db_path not in _storage_cache:
             _storage_cache[db_path] = SessionStorage()
         return _storage_cache[db_path]
+
