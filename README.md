@@ -128,8 +128,12 @@ Most agent SDKs are tested against the happy path. StreamCtx is tested against p
 - **Soak-tested**: 500+ continuous checkpoint cycles with stable memory (no leak) and flat/improving latency over time
 - **Adversarially fuzzed**: the Poison Detector is fed corrupt JSON, null values, and prompt-injection-style payloads on purpose, so it never crashes on real-world garbage
 - **Benchmarked**: Causal Failure Attribution verified against the Who&When dataset
+- **Concurrency-tested**: 50 simultaneous workers hammering the SQLite backend (writes + Attribution/Replay reads) with zero errors, after fixing a WAL/connection-pooling + missing-index issue found by this exact testing
 
 If it ships, it's because it survived being broken on purpose first.
+
+**Platform testing, honestly stated:** day-to-day development happens on Windows. Every push is also verified on Linux and macOS via a GitHub Actions matrix (Ubuntu, macOS, Windows × Python 3.9–3.12, 12/12 combinations passing) — but that's CI coverage, not hands-on daily use on those platforms. If you hit something platform-specific we didn't catch, please open an issue.
+
 
 ---
 
