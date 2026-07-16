@@ -140,7 +140,7 @@ class PoisonDetector:
     ) -> dict[str, Any]:
         """Detect same error repeating 3+ times."""
         content_lower = [
-            (m.get("content") or "").lower() for m in messages
+            str(m.get("content") or "").lower() for m in messages
         ]
 
         for pattern in ERROR_PATTERNS:
@@ -163,7 +163,7 @@ class PoisonDetector:
     ) -> dict[str, Any]:
         """Detect contradictory facts in context."""
         all_content = " ".join(
-            (m.get("content") or "").lower() for m in messages
+            str(m.get("content") or "").lower() for m in messages
         )
 
         for word1, word2 in CONTRADICTION_PAIRS:
@@ -184,7 +184,7 @@ class PoisonDetector:
 
         error_count = 0
         for msg in recent:
-            content = (msg.get("content") or "").lower()
+            content = str(msg.get("content") or "").lower()
             for pattern in ERROR_PATTERNS[:5]:  # Top 5 patterns
                 if re.search(pattern, content):
                     error_count += 1
@@ -204,7 +204,7 @@ class PoisonDetector:
     ) -> dict[str, Any]:
         """Detect assistant giving same response repeatedly."""
         assistant_msgs = [
-            (m.get("content") or "")[:100]
+            str(m.get("content") or "")[:100]
             for m in messages
             if m.get("role") == "assistant"
         ]
