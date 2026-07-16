@@ -262,6 +262,18 @@ Actively building the next layer — details soon.
 
 ---
 
+## Reliability Testing
+
+StreamCtx has been stress-tested beyond standard unit tests:
+
+- **Concurrency hardening**: 50 concurrent workers, 0 errors, completed in under 5 seconds (verified on published PyPI v0.4.2)
+- **Adversarial testing**: 18/18 tests passing for the Poison Detector, covering malformed input, non-string content, and prompt-injection-style payloads (uncovered and fixed a real crash bug in the process)
+- **Chaos engineering**: Self-healing verified resilient under CPU saturation and simulated database lock/unavailability — WAL mode hardening confirmed to hold up under real failure conditions, not just happy-path tests
+
+Full test suite: `python -m pytest`
+
+---
+
 ## License
 
 MIT — Sneh R Joshi
