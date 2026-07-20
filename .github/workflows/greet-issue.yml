@@ -1,38 +1,26 @@
-name: Greet New Issue
+
+name: Greet New Issues
 
 on:
+  issues:
+    types: [opened]
 
-issues:
-
-types: [opened]
+permissions:
+  issues: write
 
 jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on new issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "Thanks for reporting this! We'll triage it within 24 hours."
+            })
 
-greet:
-
-runs-on: ubuntu-latest
-
-steps:
-
-- name: Comment on issue
-
-uses: actions/github-script@v7
-
-with:
-
-script: |
-
-github.rest.issues.createComment({
-
-owner: context.repo.owner,
-
-repo: context.repo.repo,
-
-issue_number: context.issue.number,
-
-body: "Thanks for the report! I'll triage this within 24 hours. If it's critical
-
-(crash/data loss), tag it `severity:critical` and I'll prioritize immediately."
-
-})
 
