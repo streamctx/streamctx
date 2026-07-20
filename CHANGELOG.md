@@ -1,4 +1,4 @@
-\# Changelog
+# Changelog
 
 
 
@@ -6,25 +6,27 @@ All notable changes to StreamCtx will be documented in this file.
 
 
 
-\## \[Unreleased]
+## [Unreleased]
 
-\### Added
+### Added
 
-\- Bug report issue template
+- Bug report issue template
 
-\- Auto-acknowledgment workflow for new issues
+- Auto-acknowledgment workflow for new issues
 
-\- Severity labels (critical, medium, minor)
+- Severity labels (critical, medium, minor)
 
+### Fixed
 
+- Minor documentation clarity improvements
 
-\## \[0.4.2] - 2026-07-13
+## [0.4.2] - 2026-07-13
 
-\### Added
+### Added
 
-\- Causal Failure Attribution Engine
+- Causal Failure Attribution Engine
 
-\- Counterfactual Replay Engine
+- Counterfactual Replay Engine
 
 
 

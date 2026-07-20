@@ -5,7 +5,7 @@ with open("README.md", encoding="utf-8") as f:
 
 setup(
     name="streamctx",
-    version="0.4.2",
+    version="0.4.3",
     description="Context health monitoring for AI agents — detect poisoning, drift, loops",
     long_description=long_description,
     long_description_content_type="text/markdown",

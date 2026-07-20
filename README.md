@@ -6,7 +6,7 @@
 [![CI](https://github.com/streamctx/streamctx/actions/workflows/test.yml/badge.svg)](https://github.com/streamctx/streamctx/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Free Forever](https://img.shields.io/badge/core-free%20forever-blue)]()
-[![Tests](https://img.shields.io/badge/tests-67%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-89%20passing-brightgreen)]()
 
 Every AI agent framework tells you *how many tokens* you used. None of them tell you *why your agent is broken*.
 
