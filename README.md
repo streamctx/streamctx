@@ -8,6 +8,8 @@
 [![Free Forever](https://img.shields.io/badge/core-free%20forever-blue)]()
 [![Tests](https://img.shields.io/badge/tests-89%20passing-brightgreen)]()
 
+See [CHANGELOG.md](CHANGELOG.md) for release history and version notes.
+
 Every AI agent framework tells you *how many tokens* you used. None of them tell you *why your agent is broken*.
 
 StreamCtx is a **Context Nervous System** for AI agents — a lightweight Python SDK that sits between your app and any LLM API, watching every message for signs of trouble: poisoned context, silent drift, runaway loops, and failures that trace back to something that happened 10 steps ago.
