@@ -5,3 +5,5 @@ openai
 python-dotenv
 pandas
 streamlit
+streamlit>=1.30
+streamlit>=0.4.3
