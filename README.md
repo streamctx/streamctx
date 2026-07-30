@@ -9,6 +9,7 @@
 [![Tests](https://img.shields.io/badge/tests-89%20passing-brightgreen)]()
 
 See [CHANGELOG.md](CHANGELOG.md) for release history and version notes.
+See [Terms of Service](TERMS.md) and [Privacy Policy](PRIVACY.md)
 
 Every AI agent framework tells you *how many tokens* you used. None of them tell you *why your agent is broken*.
 
