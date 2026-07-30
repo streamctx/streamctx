@@ -10,6 +10,7 @@
 
 See [CHANGELOG.md](CHANGELOG.md) for release history and version notes.
 See [Terms of Service](TERMS.md) and [Privacy Policy](PRIVACY.md)
+See [DEPLOYMENT.md](DEPLOYMENT.md) for running StreamCtx in production.
 
 Every AI agent framework tells you *how many tokens* you used. None of them tell you *why your agent is broken*.
 
