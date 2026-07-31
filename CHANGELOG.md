@@ -5,8 +5,14 @@
 
    This project uses Semantic Versioning. While StreamCtx is on a 0.x version, minor version bumps         (0.4.  x → 0.5.0) may include breaking changes; patch bumps (0.4.2 → 0.4.3) are always safe,      backward-compatible updates.
 
-## [Unreleased]
-        •       (add new changes here as you make them)
+## [0.4.4] - 2026-07-31
+
+### Fixed
+          -  `wrap()` now tracks calls per-client instance instead of relying on a
+              global `_originals` check, fixing a silent failure where duck-typed
+             (non-genuine SDK) clients were not tracked at all — `get_stats()` and
+             `resume()` would silently return zero/empty data. (#5)
+
 
 ## [0.4.3] - 2026-07
 
