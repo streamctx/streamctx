@@ -191,58 +191,57 @@ class LLMTracker:
     def wrap(self, client: Any) -> Any:
         self._ensure_session()
         client_id = id(client)
-        if client_id in self.state._wrapped_clients:
-            return client
+        with _wrapped_client_lock:
+            if client_id in _wrapped_client_ids:
+                return client
 
         if hasattr(client, "chat") and hasattr(client.chat, "completions"):
             key = "openai.resources.chat.completions.Completions.create"
-            if key in self.state._originals:
-                self.state._wrapped_clients.add(client_id)
-                return client
-            import openai.resources.chat.completions.completions as completions_mod
             completions = client.chat.completions
-            original_create = self.state._originals.get(
-                key, completions_mod.Completions.create
-            )
+            original_create = completions.create
+            if key not in self.state._originals:
+                self.state._originals[key] = original_create
             tracker = self
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
                 return tracker._intercept_call(
-                    lambda: original_create(completions, *args, **kwargs),
+                    lambda: original_create(*args, **kwargs),
                     provider="openai",
                     kwargs=kwargs,
                 )
 
             completions.create = patched_create
-            self.state._wrapped_clients.add(client_id)
+            with _wrapped_client_lock:
+                _wrapped_client_ids.add(client_id)
             return client
 
         if hasattr(client, "messages") and hasattr(client.messages, "create"):
             key = "anthropic.resources.messages.Messages.create"
-            if key in self.state._originals:
-                self.state._wrapped_clients.add(client_id)
-                return client
-            import anthropic.resources.messages.messages as messages_mod
             messages = client.messages
-            original_create = self.state._originals.get(
-                key, messages_mod.Messages.create
-            )
+            original_create = messages.create
+            if key not in self.state._originals:
+                self.state._originals[key] = original_create
             tracker = self
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
                 return tracker._intercept_call(
-                    lambda: original_create(messages, *args, **kwargs),
+                    lambda: original_create(*args, **kwargs),
                     provider="anthropic",
                     kwargs=kwargs,
                 )
 
             messages.create = patched_create
-            self.state._wrapped_clients.add(client_id)
+            with _wrapped_client_lock:
+                _wrapped_client_ids.add(client_id)
             return client
 
         raise TypeError(
             "streamctx.wrap() supports OpenAI and Anthropic SDK clients only."
         )
+
+
+
+    
 
     def get_stats(self) -> dict[str, Any]:
         if self.state.session_id is None:
@@ -502,6 +501,9 @@ class LLMTracker:
 
         return input_tokens, output_tokens
 
+
+_wrapped_client_ids: set[int] = set()
+_wrapped_client_lock = threading.Lock()
 
 _trackers: dict[str, "LLMTracker"] = {}
 _trackers_lock = threading.Lock()
