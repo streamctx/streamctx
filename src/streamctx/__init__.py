@@ -18,7 +18,7 @@ from .compressor import compress_messages, get_compression_stats
 from .poison_detector import PoisonDetector
 from .differ import ContextDiffer
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 __all__ = [
     "start", "wrap", "report", "stop",
     "checkpoint", "resume", "get_session_id",
