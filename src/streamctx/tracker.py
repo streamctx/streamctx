@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import weakref
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -189,18 +190,21 @@ class LLMTracker:
         return self.healer.get_stats()
 
     def wrap(self, client: Any) -> Any:
+
         self._ensure_session()
-        client_id = id(client)
         with _wrapped_client_lock:
-            if client_id in _wrapped_client_ids:
+            if client in _wrapped_clients:
                 return client
 
         if hasattr(client, "chat") and hasattr(client.chat, "completions"):
-            key = "openai.resources.chat.completions.Completions.create"
             completions = client.chat.completions
-            original_create = completions.create
-            if key not in self.state._originals:
-                self.state._originals[key] = original_create
+            current = completions.create
+            if getattr(current, "_streamctx_patched", False):
+
+                with _wrapped_client_lock:
+                    _wrapped_clients.add(client)
+                return client
+            original_create = current
             tracker = self
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
@@ -209,18 +213,21 @@ class LLMTracker:
                     provider="openai",
                     kwargs=kwargs,
                 )
+            patched_create._streamctx_patched = True
 
             completions.create = patched_create
             with _wrapped_client_lock:
-                _wrapped_client_ids.add(client_id)
+                _wrapped_clients.add(client)
             return client
 
         if hasattr(client, "messages") and hasattr(client.messages, "create"):
-            key = "anthropic.resources.messages.Messages.create"
             messages = client.messages
-            original_create = messages.create
-            if key not in self.state._originals:
-                self.state._originals[key] = original_create
+            current = messages.create
+            if getattr(current, "_streamctx_patched", False):
+                with _wrapped_client_lock:
+                    _wrapped_clients.add(client)
+                return client
+            original_create = current
             tracker = self
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
@@ -229,15 +236,14 @@ class LLMTracker:
                     provider="anthropic",
                     kwargs=kwargs,
                 )
+            patched_create._streamctx_patched = True
 
             messages.create = patched_create
             with _wrapped_client_lock:
-                _wrapped_client_ids.add(client_id)
+                _wrapped_clients.add(client)
             return client
 
-        raise TypeError(
-            "streamctx.wrap() supports OpenAI and Anthropic SDK clients only."
-        )
+        return client
 
 
 
@@ -297,6 +303,7 @@ class LLMTracker:
                         provider="openai",
                         kwargs=kwargs,
                     )
+                patched_create._streamctx_patched = True
 
                 completions_cls.create = patched_create
 
@@ -319,6 +326,7 @@ class LLMTracker:
                         provider="anthropic",
                         kwargs=kwargs,
                     )
+                patched_create._streamctx_patched = True
 
                 messages_cls.create = patched_create
 
@@ -502,7 +510,7 @@ class LLMTracker:
         return input_tokens, output_tokens
 
 
-_wrapped_client_ids: set[int] = set()
+_wrapped_clients: "weakref.WeakSet" = weakref.WeakSet()
 _wrapped_client_lock = threading.Lock()
 
 _trackers: dict[str, "LLMTracker"] = {}
