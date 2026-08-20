@@ -1,9 +1,8 @@
+streamctx
 rich==13.7.0
 supabase
 httpx
 openai
 python-dotenv
 pandas
-streamlit
 streamlit>=1.30
-streamlit>=0.4.3
