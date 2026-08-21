@@ -19,6 +19,7 @@ Run locally:
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any
@@ -27,6 +28,8 @@ import streamlit as st
 
 import streamctx
 from streamctx.attribution import get_attribution_engine
+from streamctx.replay import CounterfactualReplayer
+from streamctx.storage import get_storage
 
 # ---------------------------------------------------------------------------
 # Scenario: AI coding agent fixing a failing pytest suite
@@ -554,6 +557,312 @@ def _attribution_view(result: Any) -> dict[str, Any]:
     }
 
 
+def _parse_messages_json(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return raw
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _build_capability_extras(result: dict[str, Any]) -> dict[str, Any]:
+    """One-time Context Diff + dry-run Replay against the demo session.
+
+    Reads already-persisted SQLite rows. No live LLM calls.
+    """
+    extras: dict[str, Any] = {
+        "checkpoints": [],
+        "context_diff": None,
+        "replay": None,
+    }
+    session_id = result.get("session_id")
+    if session_id is None:
+        return extras
+
+    try:
+        extras["checkpoints"] = streamctx.list_checkpoints(int(session_id))
+    except Exception as exc:
+        extras["checkpoints"] = []
+        extras["checkpoint_error"] = str(exc)
+
+    messages_a: list[dict[str, Any]] = []
+    messages_b: list[dict[str, Any]] = []
+    step_a, step_b = 0, 0
+    try:
+        calls = get_storage().get_calls_for_session(int(session_id))
+        if len(calls) >= 2:
+            early_idx = min(2, len(calls) - 2)
+            early, late = calls[early_idx], calls[-1]
+            messages_a = _parse_messages_json(early.get("messages_json"))
+            messages_b = _parse_messages_json(late.get("messages_json"))
+            step_a = early_idx + 1
+            step_b = len(calls)
+    except Exception as exc:
+        extras["context_diff_error"] = str(exc)
+
+    if messages_a and messages_b:
+        diff = streamctx.context_diff(
+            messages_a,
+            messages_b,
+            step_a=step_a,
+            step_b=step_b,
+        )
+        extras["context_diff"] = {
+            "step_a": step_a,
+            "step_b": step_b,
+            "drift_score": diff.get("drift_score"),
+            "token_delta": diff.get("token_delta"),
+            "summary": diff.get("summary"),
+            "warnings": diff.get("warnings") or [],
+            "added_count": len(diff.get("added") or []),
+            "removed_count": len(diff.get("removed") or []),
+            "unchanged_count": len(diff.get("unchanged") or []),
+        }
+
+    from_step = POISON_STEP
+    checkpoints = extras.get("checkpoints") or []
+    if checkpoints:
+        step_numbers = [int(c["step_number"]) for c in checkpoints]
+        at_or_before = [s for s in step_numbers if s <= POISON_STEP]
+        from_step = max(at_or_before) if at_or_before else step_numbers[0]
+
+    try:
+        # Workaround: streamctx.replay is overwritten by the replay submodule
+        # after list_checkpoints() does `from .replay import ...` (SDK namespace
+        # collision). Calling streamctx.replay() then raises
+        # TypeError: 'module' object is not callable. Use the class until the
+        # core package stops shadowing the public function.
+        replayed = CounterfactualReplayer().replay(
+            int(session_id),
+            from_step,
+            with_context={
+                "role": "user",
+                "content": (
+                    "Counterfactual: ignore the poisoned pytest trailer and "
+                    "continue from the last valid failing-test output."
+                ),
+            },
+            dry_run=True,
+        )
+        extras["replay"] = {
+            "session_id": replayed.session_id,
+            "from_step": replayed.from_step,
+            "dry_run": replayed.dry_run,
+            "injection_summary": replayed.injection_summary,
+            "original_message_count": len(replayed.original_messages or []),
+            "counterfactual_message_count": len(replayed.counterfactual_messages or []),
+            "steps_replayed": replayed.steps_replayed,
+        }
+    except Exception as exc:
+        extras["replay"] = {"error": str(exc)}
+
+    return extras
+
+
+def _capability_extras(result: dict[str, Any]) -> dict[str, Any]:
+    cached = result.get("capability_extras")
+    if cached is not None:
+        return cached
+    extras = _build_capability_extras(result)
+    result["capability_extras"] = extras
+    return extras
+
+
+def _render_capability_card(
+    icon: str,
+    name: str,
+    problem: str,
+    api_snippet: str,
+    body: Any,
+) -> None:
+    st.markdown(
+        f"<div class='cap-card'>"
+        f"<div class='cap-title'>{icon} {name}</div>"
+        f"<div class='cap-problem'>{problem}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("API + this session", expanded=False):
+        st.code(api_snippet, language="python")
+        if callable(body):
+            body()
+        else:
+            st.json(body)
+
+
+def _render_capability_grid(result: dict[str, Any]) -> None:
+    extras = _capability_extras(result)
+    scan = result.get("poison_scan") or {}
+    heal = result.get("healing") or {}
+    attributions = result.get("attribution") or []
+    cstats = result.get("compression") or {}
+    checkpoints = extras.get("checkpoints") or []
+    session_id = result.get("session_id")
+
+    def poison_body() -> None:
+        if not scan:
+            st.info("No poison scan was captured for this session.")
+            return
+        c1, c2, c3 = st.columns(3)
+        c1.metric("health_score", scan.get("health_score"))
+        c2.metric("is_poisoned", str(scan.get("is_poisoned")))
+        c3.metric("warnings", len(scan.get("warnings") or []))
+        for warning in scan.get("warnings") or []:
+            st.warning(warning)
+        st.caption(scan.get("recommendation") or "")
+
+    def heal_body() -> None:
+        c1, c2 = st.columns(2)
+        c1.metric("recoveries", heal.get("recovery_count", 0))
+        c2.metric("failures", heal.get("failure_count", 0))
+        st.json(heal)
+
+    def checkpoint_body() -> None:
+        if extras.get("checkpoint_error"):
+            st.warning(extras["checkpoint_error"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("session_id", str(session_id))
+        c2.metric("checkpoints", len(checkpoints))
+        last_msgs = checkpoints[-1]["message_count"] if checkpoints else 0
+        c3.metric("msgs at last ckpt", last_msgs)
+        if checkpoints:
+            st.json(checkpoints[:8] if len(checkpoints) > 8 else checkpoints)
+            if len(checkpoints) > 8:
+                st.caption(f"Showing first 8 of {len(checkpoints)} checkpoints.")
+
+    def attribution_body() -> None:
+        if not attributions:
+            st.info("No failed calls were recorded, so attribution has nothing to score.")
+            return
+        top = attributions[0]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("classification", top.get("classification"))
+        c2.metric("confidence", f"{float(top.get('confidence') or 0) * 100:.1f}%")
+        offset = top.get("root_cause_step_offset")
+        c3.metric("root-cause offset", offset)
+        st.write(top.get("reason") or "")
+        st.json(top.get("signal_breakdown") or {})
+
+    def compression_body() -> None:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("original_tokens", f"{int(cstats.get('original_tokens') or 0):,}")
+        c2.metric("compressed_tokens", f"{int(cstats.get('compressed_tokens') or 0):,}")
+        saved = int(cstats.get("saved_tokens") or 0)
+        c3.metric("saved_tokens", f"{saved:,} ({cstats.get('compression_pct', 0)}%)")
+        st.json(cstats)
+
+    def diff_body() -> None:
+        diff = extras.get("context_diff")
+        if extras.get("context_diff_error"):
+            st.warning(extras["context_diff_error"])
+        if not diff:
+            st.info("Not enough persisted call rows to diff two steps.")
+            return
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("drift_score", diff.get("drift_score"))
+        c2.metric("token_delta", diff.get("token_delta"))
+        c3.metric("added", diff.get("added_count"))
+        c4.metric("removed", diff.get("removed_count"))
+        st.write(diff.get("summary") or "")
+        if diff.get("warnings"):
+            st.json(diff["warnings"])
+        st.caption(
+            f"Compared call {diff.get('step_a')} vs call {diff.get('step_b')} "
+            "from this session's stored messages_json."
+        )
+
+    def replay_body() -> None:
+        replayed = extras.get("replay")
+        if not replayed:
+            st.info("No replay result cached for this session.")
+            return
+        if replayed.get("error"):
+            st.warning(replayed["error"])
+            return
+        c1, c2, c3 = st.columns(3)
+        c1.metric("from_step", replayed.get("from_step"))
+        c2.metric("original msgs", replayed.get("original_message_count"))
+        c3.metric("counterfactual msgs", replayed.get("counterfactual_message_count"))
+        st.caption(replayed.get("injection_summary") or "")
+        st.json(replayed)
+
+    cards = [
+        {
+            "icon": "🛡️",
+            "name": "Poison Detector",
+            "problem": "Tool output can smuggle instructions into the message list; you only notice after the agent obeys them.",
+            "api": "streamctx.scan(messages)",
+            "body": poison_body,
+        },
+        {
+            "icon": "🩹",
+            "name": "Self-Healing",
+            "problem": "A wrapped call exception currently kills the turn; there is no retry from the last good context.",
+            "api": "tracker.healing_stats()",
+            "body": heal_body,
+        },
+        {
+            "icon": "💾",
+            "name": "Checkpoint + Resume",
+            "problem": "A crash or poison at step N means replaying the whole session from step 0.",
+            "api": "tracker.checkpoint()\ntracker.resume(session_id)",
+            "body": checkpoint_body,
+        },
+        {
+            "icon": "🎯",
+            "name": "Attribution Engine",
+            "problem": "When a later call fails, you cannot tell which earlier turn actually caused it.",
+            "api": "streamctx.attribute_session(session_id)",
+            "body": attribution_body,
+        },
+        {
+            "icon": "📦",
+            "name": "Context Compression",
+            "problem": "The growing system prompt + history is resent on every call; token spend is opaque.",
+            "api": "streamctx.compress(messages)",
+            "body": compression_body,
+        },
+        {
+            "icon": "🔍",
+            "name": "Context Diff",
+            "problem": "You cannot see what was added or dropped between two steps, so context drift is a guess.",
+            "api": "streamctx.context_diff(messages_a, messages_b, step_a=3, step_b=16)",
+            "body": diff_body,
+        },
+        {
+            "icon": "⏪",
+            "name": "Counterfactual Replay",
+            "problem": "You cannot test 'what if step N had different context' without re-running live LLM calls.",
+            "api": "streamctx.replay(session_id, from_step, with_context=..., dry_run=True)",
+            "body": replay_body,
+        },
+    ]
+
+    st.markdown("#### All 7 capabilities")
+    st.caption(
+        "Same demo session as above — expand a card for the real API call and "
+        "the captured output. Context Diff and Counterfactual Replay run once "
+        "against stored session rows (`dry_run=True`); no extra LLM calls."
+    )
+
+    for row_start in range(0, len(cards), 3):
+        row = cards[row_start : row_start + 3]
+        cols = st.columns(len(row), gap="medium")
+        for col, card in zip(cols, row):
+            with col:
+                _render_capability_card(
+                    card["icon"],
+                    card["name"],
+                    card["problem"],
+                    card["api"],
+                    card["body"],
+                )
+
+
 def simulate_comparison() -> dict[str, Any]:
     """Run the 16-step suite twice: unwrapped (silent corruption) vs wrapped."""
 
@@ -673,7 +982,7 @@ def simulate_comparison() -> dict[str, Any]:
     saved = int(compression["stats"].get("saved_tokens") or 0)
     estimated_usd = (saved / 1000.0) * ESTIMATED_USD_PER_1K
 
-    return {
+    result = {
         "session_id": session_id,
         "agent_id": agent_id,
         "without_log": without_log,
@@ -688,6 +997,8 @@ def simulate_comparison() -> dict[str, Any]:
         "estimated_usd": estimated_usd,
         "with_message_count": len(with_messages),
     }
+    result["capability_extras"] = _build_capability_extras(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +1043,25 @@ def _inject_theme() -> None:
             text-transform: uppercase;
         }
         .muted { color: #8b949e; font-size: 0.86rem; }
+        .cap-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 0.85rem 0.95rem 0.55rem 0.95rem;
+            margin-bottom: 0.75rem;
+            min-height: 6.5rem;
+        }
+        .cap-title {
+            font-weight: 650;
+            font-size: 0.98rem;
+            color: #e6edf3;
+            margin-bottom: 0.3rem;
+        }
+        .cap-problem {
+            color: #8b949e;
+            font-size: 0.84rem;
+            line-height: 1.4;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -998,6 +1328,8 @@ def main() -> None:
         with finals[1]:
             st.success("Final answer with StreamCtx (correct)")
             st.write(result["with_final"])
+
+        _render_capability_grid(result)
 
     if resume_clicked:
         if not st.session_state.session_id:
