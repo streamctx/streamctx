@@ -22,6 +22,7 @@ setup(
         "openai": ["openai>=1.0.0"],
         "anthropic": ["anthropic>=0.25.0"],
         "all": ["openai>=1.0.0", "anthropic>=0.25.0"],
+        "dev": ["psutil", "httpx"],
     },
     classifiers=[
         "Development Status :: 4 - Beta",
