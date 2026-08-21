@@ -5,6 +5,15 @@
 
    This project uses Semantic Versioning. While StreamCtx is on a 0.x version, minor version bumps         (0.4.  x → 0.5.0) may include breaking changes; patch bumps (0.4.2 → 0.4.3) are always safe,      backward-compatible updates.
 
+## [0.4.6] - 2026-08-21
+
+### Fixed
+          -  LLM calls were counted twice when `start()` and `wrap()` were used
+              together. `_patch_openai()` and `_patch_anthropic()` now set
+              `_streamctx_patched` on the monkeypatched `create` methods so
+              `wrap()` skips a second intercept layer instead of stacking on
+              the global SDK patch.
+
 ## [0.4.4] - 2026-07-31
 
 ### Fixed
