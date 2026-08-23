@@ -31,9 +31,35 @@ class SelfHealingEngine:
         self._last_valid_messages = list(messages)
         self._last_valid_response = response
 
-    def record_failure(self) -> None:
-        """Track failure count."""
+    def record_failure(
+        self,
+        error_message: Optional[str] = None,
+        session_id: Optional[int] = None,
+        failed_call_id: Optional[int] = None,
+        storage: Any = None,
+    ) -> None:
+        """Track failure count and optionally shadow-monitor a persisted call.
+
+        The SDK persist path (``SessionStorage.record_call``) already
+        schedules shadow repair after a failed insert.  Agents that
+        call ``record_failure`` themselves after writing the ``calls``
+        row can pass ``session_id`` / ``failed_call_id`` here.  Extra
+        kwargs are ignored by older callers — this never raises.
+        """
         self._failure_count += 1
+        if session_id is None or failed_call_id is None:
+            return
+        try:
+            from .shadow import maybe_schedule_shadow_repair
+
+            maybe_schedule_shadow_repair(
+                session_id=session_id,
+                failed_call_id=failed_call_id,
+                error_message=error_message,
+                storage=storage,
+            )
+        except Exception:
+            return
 
     def can_heal(self) -> bool:
         """Check if we have valid context to recover from."""
