@@ -25,7 +25,7 @@ be replaced/augmented later, not to be the final word in accuracy.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from .storage import get_storage
@@ -209,9 +209,27 @@ class AttributionEngine:
     step, using the weighted heuristic described at module level.
     """
 
-    def __init__(self, storage: Any = None, lookback: int = DEFAULT_LOOKBACK) -> None:
+    def __init__(
+        self,
+        storage: Any = None,
+        lookback: int = DEFAULT_LOOKBACK,
+        evidence: Any = None,
+    ) -> None:
         self.storage = storage or get_storage()
         self.lookback = lookback
+        self.evidence = evidence
+
+    def _finish(self, result: AttributionResult) -> AttributionResult:
+        """Best-effort Layer 4 attestation; never breaks attribution."""
+        from .evidence import safe_append_evidence
+
+        safe_append_evidence(
+            "attribution",
+            result.failed_call_id,
+            asdict(result),
+            ledger=self.evidence,
+        )
+        return result
 
     def _load_session_calls(self, session_id: int) -> list[CallSnapshot]:
         """Load all calls for a session, ordered chronologically.
@@ -250,20 +268,24 @@ class AttributionEngine:
         index_by_id = {c.id: i for i, c in enumerate(calls)}
 
         if failed_call_id not in index_by_id:
-            return AttributionResult(
-                session_id=session_id,
-                failed_call_id=failed_call_id,
-                root_cause_call_id=None,
-                root_cause_step_offset=None,
-                confidence=0.0,
-                reason="failed_call_id not found in session",
-                signal_breakdown={},
+            return self._finish(
+                AttributionResult(
+                    session_id=session_id,
+                    failed_call_id=failed_call_id,
+                    root_cause_call_id=None,
+                    root_cause_step_offset=None,
+                    confidence=0.0,
+                    reason="failed_call_id not found in session",
+                    signal_breakdown={},
+                )
             )
 
         fail_idx = index_by_id[failed_call_id]
         failed_call = calls[fail_idx]
         if is_non_content_failure(failed_call.error_message):
-            return _abstain(session_id, failed_call_id, INFRA_NON_CONTENT_REASON)
+            return self._finish(
+                _abstain(session_id, failed_call_id, INFRA_NON_CONTENT_REASON)
+            )
 
         lookback_start = max(0, fail_idx - self.lookback)
 
@@ -299,18 +321,22 @@ class AttributionEngine:
                 }
 
         if best_call is None or not _has_content_signal(best_breakdown):
-            return _abstain(session_id, failed_call_id, UNATTRIBUTABLE_REASON)
+            return self._finish(
+                _abstain(session_id, failed_call_id, UNATTRIBUTABLE_REASON)
+            )
 
         reason = self._explain(best_call, best_offset, best_breakdown)
 
-        return AttributionResult(
-            session_id=session_id,
-            failed_call_id=failed_call_id,
-            root_cause_call_id=best_call.id if best_call else None,
-            root_cause_step_offset=best_offset,
-            confidence=round(min(1.0, max(0.0, best_score)), 4),
-            reason=reason,
-            signal_breakdown=best_breakdown,
+        return self._finish(
+            AttributionResult(
+                session_id=session_id,
+                failed_call_id=failed_call_id,
+                root_cause_call_id=best_call.id if best_call else None,
+                root_cause_step_offset=best_offset,
+                confidence=round(min(1.0, max(0.0, best_score)), 4),
+                reason=reason,
+                signal_breakdown=best_breakdown,
+            )
         )
 
     def attribute_session(self, session_id: int) -> list[AttributionResult]:

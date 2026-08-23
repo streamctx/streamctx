@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -233,10 +233,26 @@ class VerifiedRepairEngine:
         storage: Any = None,
         attribution_engine: Any = None,
         replayer: Any = None,
+        evidence: Any = None,
     ) -> None:
         self.storage = storage or get_storage()
-        self.attribution = attribution_engine or AttributionEngine(storage=self.storage)
+        self.evidence = evidence
+        self.attribution = attribution_engine or AttributionEngine(
+            storage=self.storage, evidence=evidence
+        )
         self.replayer = replayer or CounterfactualReplayer(storage=self.storage)
+
+    def _finish(self, result: RepairResult) -> RepairResult:
+        """Best-effort Layer 4 attestation; never breaks repair."""
+        from .evidence import safe_append_evidence
+
+        safe_append_evidence(
+            "repair",
+            result.failed_call_id,
+            asdict(result),
+            ledger=self.evidence,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Public API
@@ -371,18 +387,20 @@ class VerifiedRepairEngine:
             correct_value=correct_value,
         )
 
-        return RepairResult(
-            session_id=session_id,
-            failed_call_id=failed_call_id,
-            root_cause_call_id=attribution.root_cause_call_id,
-            dominant_signal=dominant,
-            fix_candidate=fix_candidate,
-            resolved=resolved,
-            confidence_delta=confidence_delta,
-            proof=proof,
-            dry_run=dry_run,
-            reason=reason,
-            correct_value=correct_value,
+        return self._finish(
+            RepairResult(
+                session_id=session_id,
+                failed_call_id=failed_call_id,
+                root_cause_call_id=attribution.root_cause_call_id,
+                dominant_signal=dominant,
+                fix_candidate=fix_candidate,
+                resolved=resolved,
+                confidence_delta=confidence_delta,
+                proof=proof,
+                dry_run=dry_run,
+                reason=reason,
+                correct_value=correct_value,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -653,17 +671,19 @@ class VerifiedRepairEngine:
         }
         if extra_proof:
             proof.update(extra_proof)
-        return RepairResult(
-            session_id=session_id,
-            failed_call_id=failed_call_id,
-            root_cause_call_id=attribution.root_cause_call_id,
-            dominant_signal=dominant,
-            fix_candidate=fix_candidate,
-            resolved=False,
-            confidence_delta=0.0,
-            proof=proof,
-            dry_run=dry_run,
-            reason=str((extra_proof or {}).get("reason") or attribution.reason),
+        return self._finish(
+            RepairResult(
+                session_id=session_id,
+                failed_call_id=failed_call_id,
+                root_cause_call_id=attribution.root_cause_call_id,
+                dominant_signal=dominant,
+                fix_candidate=fix_candidate,
+                resolved=False,
+                confidence_delta=0.0,
+                proof=proof,
+                dry_run=dry_run,
+                reason=str((extra_proof or {}).get("reason") or attribution.reason),
+            )
         )
 
     def _infra_unresolved(
@@ -689,17 +709,19 @@ class VerifiedRepairEngine:
             "before_after_diff": {},
             "reason": INFRA_NOT_REPAIRABLE,
         }
-        return RepairResult(
-            session_id=session_id,
-            failed_call_id=failed_call_id,
-            root_cause_call_id=None,
-            dominant_signal=None,
-            fix_candidate={},
-            resolved=False,
-            confidence_delta=0.0,
-            proof=proof,
-            dry_run=dry_run,
-            reason=INFRA_NOT_REPAIRABLE,
+        return self._finish(
+            RepairResult(
+                session_id=session_id,
+                failed_call_id=failed_call_id,
+                root_cause_call_id=None,
+                dominant_signal=None,
+                fix_candidate={},
+                resolved=False,
+                confidence_delta=0.0,
+                proof=proof,
+                dry_run=dry_run,
+                reason=INFRA_NOT_REPAIRABLE,
+            )
         )
 
     @staticmethod
