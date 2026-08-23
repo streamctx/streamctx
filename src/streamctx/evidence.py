@@ -4,14 +4,23 @@ Tamper-evident, log-independent attestation of every attribution and
 repair record.  Lives in a separate SQLite file (``evidence_ledger.db``),
 never in ``sessions.db``.
 
+Entries are hash-chained and signed with Ed25519.  The private key stays
+server-side (``STREAMCTX_EVIDENCE_PRIVATE_KEY`` PEM path).  Customers
+receive only the public key, so they can verify a bundle but cannot forge
+entries.
+
 The ledger is append-only: UPDATE/DELETE are blocked by triggers and
 this module exposes no mutating code paths besides INSERT.
+
+HMAC-SHA256 ledgers from the pre-production dogfood window are wiped on
+open and replaced with an empty Ed25519 ledger (no production data to
+migrate).
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -21,10 +30,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+    load_pem_private_key,
+    load_pem_public_key,
+)
+
 logger = logging.getLogger(__name__)
 
 GENESIS_HASH = "0" * 64
 RECORD_TYPES = frozenset({"attribution", "repair"})
+SIGNING_ALGORITHM = "ed25519"
+# Frozen. Do not change the 1.0 export shape in place — add or rename
+# fields only under schema_version "1.1" or "2.0", and teach
+# scripts/verify_attestation.py about the new version. Silent edits to
+# the 1.0 object (field names, types, or required keys) break offline
+# verifiers already in customer hands.
+SCHEMA_VERSION = "1.0"
+ISSUER = "streamctx"
 
 NO_UPDATE_TRIGGER = "evidence_ledger_no_update"
 NO_DELETE_TRIGGER = "evidence_ledger_no_delete"
@@ -54,6 +85,11 @@ CREATE TABLE IF NOT EXISTS evidence_payloads (
 CREATE INDEX IF NOT EXISTS idx_evidence_payloads_session
     ON evidence_payloads(session_id);
 
+CREATE TABLE IF NOT EXISTS ledger_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS {NO_UPDATE_TRIGGER}
 BEFORE UPDATE ON evidence_ledger
 BEGIN
@@ -75,7 +111,7 @@ def _default_evidence_db_path() -> Path:
 
 
 def canonical_json(obj: Any) -> str:
-    """Stable JSON used for payload hashes and signed export bundles."""
+    """Stable JSON used for payload hashes."""
     return json.dumps(
         obj,
         sort_keys=True,
@@ -92,7 +128,7 @@ def payload_hash(payload: dict[str, Any]) -> str:
 def compute_entry_hash(
     entry_id: int,
     record_type: str,
-    record_ref_id: int,
+    record_ref_id: int | str,
     record_payload_hash: str,
     prev_hash: str,
     timestamp: str,
@@ -105,8 +141,69 @@ def compute_entry_hash(
     return hashlib.sha256(preimage.encode("utf-8")).hexdigest()
 
 
-def sign_entry_hash(entry_hash: str, key: bytes) -> str:
-    return hmac.new(key, entry_hash.encode("utf-8"), hashlib.sha256).hexdigest()
+def generate_keypair(private_key_path: Path, public_key_path: Path) -> None:
+    """Write a new Ed25519 PEM keypair. Private file is created with mode 0600."""
+    private_key = Ed25519PrivateKey.generate()
+    private_pem = private_key.private_bytes(
+        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+    )
+    public_pem = private_key.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    )
+    private_key_path = Path(private_key_path)
+    public_key_path = Path(public_key_path)
+    private_key_path.parent.mkdir(parents=True, exist_ok=True)
+    public_key_path.parent.mkdir(parents=True, exist_ok=True)
+    private_key_path.write_bytes(private_pem)
+    try:
+        os.chmod(private_key_path, 0o600)
+    except OSError:
+        pass
+    public_key_path.write_bytes(public_pem)
+
+
+def load_private_key(path: Path) -> Ed25519PrivateKey:
+    pem = Path(path).read_bytes()
+    key = load_pem_private_key(pem, password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise TypeError(
+            f"{path} is not an Ed25519 private key PEM "
+            "(STREAMCTX_EVIDENCE_PRIVATE_KEY)"
+        )
+    return key
+
+
+def load_public_key(path: Path) -> Ed25519PublicKey:
+    pem = Path(path).read_bytes()
+    key = load_pem_public_key(pem)
+    if not isinstance(key, Ed25519PublicKey):
+        raise TypeError(
+            f"{path} is not an Ed25519 public key PEM "
+            "(STREAMCTX_EVIDENCE_PUBLIC_KEY)"
+        )
+    return key
+
+
+def public_key_pem(public_key: Ed25519PublicKey) -> str:
+    return public_key.public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    ).decode("ascii")
+
+
+def sign_entry_hash(entry_hash: str, private_key: Ed25519PrivateKey) -> str:
+    """Ed25519-sign the raw SHA-256 digest; return standard base64."""
+    signature = private_key.sign(bytes.fromhex(entry_hash))
+    return base64.b64encode(signature).decode("ascii")
+
+
+def verify_entry_signature(
+    entry_hash: str, signature_b64: str, public_key: Ed25519PublicKey
+) -> bool:
+    try:
+        public_key.verify(base64.b64decode(signature_b64), bytes.fromhex(entry_hash))
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
 
 
 def _payload_session_id(payload: dict[str, Any]) -> Optional[int]:
@@ -120,27 +217,43 @@ def _payload_session_id(payload: dict[str, Any]) -> Optional[int]:
 
 
 class EvidenceLedger:
-    """Append-only hash-chained evidence store."""
+    """Append-only hash-chained evidence store, signed with Ed25519."""
 
     def __init__(
         self,
         db_path: Optional[Path] = None,
-        key: Optional[str] = None,
+        private_key_path: Optional[Path] = None,
+        public_key_path: Optional[Path] = None,
     ) -> None:
         self.db_path = Path(db_path) if db_path is not None else _default_evidence_db_path()
-        env_key = os.environ.get("STREAMCTX_EVIDENCE_KEY")
-        self._key = key if key is not None else env_key
+        priv = private_key_path or os.environ.get("STREAMCTX_EVIDENCE_PRIVATE_KEY")
+        pub = public_key_path or os.environ.get("STREAMCTX_EVIDENCE_PUBLIC_KEY")
+        self.private_key_path = Path(priv) if priv else None
+        self.public_key_path = Path(pub) if pub else None
         self._write_lock = threading.Lock()
         self._conn: Optional[sqlite3.Connection] = None
+        self._private_key: Optional[Ed25519PrivateKey] = None
+        self._public_key: Optional[Ed25519PublicKey] = None
 
-    def _key_bytes(self) -> bytes:
-        if not self._key:
+    def _require_private_key(self) -> Ed25519PrivateKey:
+        if self._private_key is not None:
+            return self._private_key
+        if self.private_key_path is None:
             raise RuntimeError(
-                "STREAMCTX_EVIDENCE_KEY is not set; cannot sign evidence"
+                "STREAMCTX_EVIDENCE_PRIVATE_KEY is not set; cannot sign evidence"
             )
-        if isinstance(self._key, bytes):
-            return self._key
-        return str(self._key).encode("utf-8")
+        self._private_key = load_private_key(self.private_key_path)
+        return self._private_key
+
+    def _require_public_key(self) -> Ed25519PublicKey:
+        if self._public_key is not None:
+            return self._public_key
+        if self.public_key_path is not None:
+            self._public_key = load_public_key(self.public_key_path)
+            return self._public_key
+        # Internal verify: derive from the server-held private key.
+        self._public_key = self._require_private_key().public_key()
+        return self._public_key
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is not None:
@@ -157,9 +270,43 @@ class EvidenceLedger:
         except sqlite3.OperationalError:
             pass
         conn.executescript(_SCHEMA)
+        self._migrate_hmac_ledger(conn)
         conn.commit()
         self._conn = conn
         return conn
+
+    def _migrate_hmac_ledger(self, conn: sqlite3.Connection) -> None:
+        """Wipe dogfood HMAC ledgers; Ed25519 is a clean break."""
+        row = conn.execute(
+            "SELECT value FROM ledger_meta WHERE key = 'signing_algorithm'"
+        ).fetchone()
+        if row is not None and str(row["value"]) == SIGNING_ALGORITHM:
+            return
+        existing = conn.execute("SELECT COUNT(*) AS n FROM evidence_ledger").fetchone()
+        count = int(existing["n"]) if existing is not None else 0
+        if count > 0:
+            logger.info(
+                "Wiping pre-Ed25519 evidence ledger (%s entries) for clean re-init",
+                count,
+            )
+            conn.executescript(
+                f"""
+                DROP TRIGGER IF EXISTS {NO_UPDATE_TRIGGER};
+                DROP TRIGGER IF EXISTS {NO_DELETE_TRIGGER};
+                DROP TABLE IF EXISTS evidence_payloads;
+                DROP TABLE IF EXISTS evidence_ledger;
+                DROP TABLE IF EXISTS ledger_meta;
+                """
+            )
+            conn.executescript(_SCHEMA)
+        conn.execute(
+            "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
+            ("signing_algorithm", SIGNING_ALGORITHM),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
+            ("schema_version", SCHEMA_VERSION),
+        )
 
     def close(self) -> None:
         with self._write_lock:
@@ -181,7 +328,7 @@ class EvidenceLedger:
         if not isinstance(payload, dict):
             raise TypeError("payload must be a dict")
 
-        key = self._key_bytes()
+        private_key = self._require_private_key()
         record_payload_hash = payload_hash(payload)
 
         with self._write_lock:
@@ -206,7 +353,7 @@ class EvidenceLedger:
                 prev_hash,
                 timestamp,
             )
-            signature = sign_entry_hash(entry_hash, key)
+            signature = sign_entry_hash(entry_hash, private_key)
 
             conn.execute(
                 """
@@ -263,7 +410,7 @@ class EvidenceLedger:
         dict
             ``valid``, ``broken_at_entry_id``, ``total_checked``.
         """
-        key = self._key_bytes()
+        public_key = self._require_public_key()
         rows = self._all_rows()
         by_id = {int(row["entry_id"]): row for row in rows}
 
@@ -292,8 +439,9 @@ class EvidenceLedger:
                     "total_checked": checked,
                 }
 
-            expected_sig = sign_entry_hash(str(row["entry_hash"]), key)
-            if not hmac.compare_digest(expected_sig, str(row["signature"])):
+            if not verify_entry_signature(
+                str(row["entry_hash"]), str(row["signature"]), public_key
+            ):
                 return {
                     "valid": False,
                     "broken_at_entry_id": entry_id,
@@ -322,15 +470,18 @@ class EvidenceLedger:
         }
 
     def export_attestation(self, session_id: int) -> dict[str, Any]:
-        """Bundle ledger rows + payloads for ``session_id``, then sign the bundle."""
-        key = self._key_bytes()
+        """Export a schema 1.0 attestation bundle for ``session_id``.
+
+        Hashes and signatures only — no raw attribution/repair payloads.
+        The issuer public key is embedded so verification is offline.
+        """
+        public_key = self._require_public_key()
         conn = self._connect()
         rows = conn.execute(
             """
             SELECT
                 e.entry_id, e.record_type, e.record_ref_id, e.record_payload_hash,
-                e.prev_hash, e.entry_hash, e.timestamp, e.signature,
-                p.payload_json
+                e.prev_hash, e.entry_hash, e.timestamp, e.signature
             FROM evidence_ledger e
             JOIN evidence_payloads p ON p.entry_id = e.entry_id
             WHERE p.session_id = ?
@@ -340,13 +491,12 @@ class EvidenceLedger:
         ).fetchall()
 
         entries: list[dict[str, Any]] = []
-        payloads: list[dict[str, Any]] = []
         for row in rows:
             entries.append(
                 {
                     "entry_id": int(row["entry_id"]),
                     "record_type": str(row["record_type"]),
-                    "record_ref_id": int(row["record_ref_id"]),
+                    "record_ref_id": str(row["record_ref_id"]),
                     "record_payload_hash": str(row["record_payload_hash"]),
                     "prev_hash": str(row["prev_hash"]),
                     "entry_hash": str(row["entry_hash"]),
@@ -354,29 +504,17 @@ class EvidenceLedger:
                     "signature": str(row["signature"]),
                 }
             )
-            payloads.append(
-                {
-                    "entry_id": int(row["entry_id"]),
-                    "record_type": str(row["record_type"]),
-                    "record_ref_id": int(row["record_ref_id"]),
-                    "payload": json.loads(row["payload_json"]),
-                }
-            )
 
-        unsigned = {
-            "format": "streamctx.evidence.v1",
-            "session_id": int(session_id),
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-            "entries": entries,
-            "payloads": payloads,
-        }
-        bundle_hash = hashlib.sha256(
-            canonical_json(unsigned).encode("utf-8")
-        ).hexdigest()
+        # schema_version 1.0 is frozen — see SCHEMA_VERSION above.
         return {
-            **unsigned,
-            "bundle_hash": bundle_hash,
-            "signature": sign_entry_hash(bundle_hash, key),
+            "schema_version": SCHEMA_VERSION,
+            "issuer": ISSUER,
+            "session_id": str(session_id),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "public_key_pem": public_key_pem(public_key),
+            "entries": entries,
+            "chain_root_hash": entries[0]["entry_hash"] if entries else None,
+            "chain_tip_hash": entries[-1]["entry_hash"] if entries else None,
         }
 
 
@@ -427,7 +565,7 @@ def safe_append_evidence(
     """Best-effort append. Failures are logged and never raised."""
     try:
         if ledger is None:
-            if not os.environ.get("STREAMCTX_EVIDENCE_KEY"):
+            if not os.environ.get("STREAMCTX_EVIDENCE_PRIVATE_KEY"):
                 return
             ledger = get_evidence_ledger()
         ledger.append_evidence(record_type, int(record_ref_id), payload)

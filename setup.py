@@ -17,12 +17,13 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         "rich>=13.0.0",
+        "cryptography>=41.0.0",
     ],
     extras_require={
         "openai": ["openai>=1.0.0"],
         "anthropic": ["anthropic>=0.25.0"],
         "all": ["openai>=1.0.0", "anthropic>=0.25.0"],
-        "dev": ["psutil", "httpx"],
+        "dev": ["psutil", "httpx", "cryptography>=41.0.0"],
     },
     classifiers=[
         "Development Status :: 4 - Beta",

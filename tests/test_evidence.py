@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import ast
+import base64
+import json
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -10,18 +16,30 @@ from streamctx.attribution import AttributionEngine
 from streamctx.evidence import (
     NO_UPDATE_TRIGGER,
     EvidenceLedger,
-    payload_hash,
+    generate_keypair,
 )
 from streamctx.repair import VerifiedRepairEngine
 from streamctx.storage import SessionStorage
 
-
-TEST_KEY = "streamctx-test-evidence-key"
+VERIFY_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "verify_attestation.py"
 
 
 @pytest.fixture
-def ledger(tmp_path):
-    return EvidenceLedger(db_path=tmp_path / "evidence_ledger.db", key=TEST_KEY)
+def keypair(tmp_path):
+    priv = tmp_path / "evidence_private.pem"
+    pub = tmp_path / "evidence_public.pem"
+    generate_keypair(priv, pub)
+    return priv, pub
+
+
+@pytest.fixture
+def ledger(tmp_path, keypair):
+    priv, pub = keypair
+    return EvidenceLedger(
+        db_path=tmp_path / "evidence_ledger.db",
+        private_key_path=priv,
+        public_key_path=pub,
+    )
 
 
 def _payload(i: int, session_id: int = 1) -> dict:
@@ -49,6 +67,15 @@ def _mutate_ledger(ledger: EvidenceLedger, sql: str, params: tuple) -> None:
     conn.execute(f"DROP TRIGGER IF EXISTS {NO_UPDATE_TRIGGER}")
     conn.execute(sql, params)
     conn.commit()
+
+
+def _run_verify(bundle_path: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(VERIFY_SCRIPT), str(bundle_path), *extra],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 class _BoomLedger:
@@ -120,10 +147,11 @@ def test_payload_hash_tamper_reports_broken_entry(ledger):
 
 def test_signature_tamper_is_caught(ledger):
     _append_n(ledger, 8)
+    bad_sig = base64.b64encode(b"\x00" * 64).decode("ascii")
     _mutate_ledger(
         ledger,
         "UPDATE evidence_ledger SET signature = ? WHERE entry_id = ?",
-        ("ff" * 32, 6),
+        (bad_sig, 6),
     )
 
     result = ledger.verify_chain()
@@ -229,24 +257,104 @@ def test_hooks_append_on_success(tmp_path, ledger):
 
 
 # ---------------------------------------------------------------------
-# Export (implemented; format still open for review)
+# Export schema 1.0
 # ---------------------------------------------------------------------
 
 
-def test_export_attestation_includes_payloads_and_signature(ledger):
+def test_export_attestation_schema(ledger):
     _append_n(ledger, 4, session_id=7)
     ledger.append_evidence("attribution", 999, _payload(0, session_id=8))
 
     bundle = ledger.export_attestation(7)
-    assert bundle["format"] == "streamctx.evidence.v1"
-    assert bundle["session_id"] == 7
+    assert bundle["schema_version"] == "1.0"
+    assert bundle["issuer"] == "streamctx"
+    assert bundle["session_id"] == "7"
+    assert bundle["public_key_pem"].startswith("-----BEGIN PUBLIC KEY-----")
+    assert "payloads" not in bundle
+    assert "payload" not in bundle
     assert len(bundle["entries"]) == 4
-    assert len(bundle["payloads"]) == 4
-    assert bundle["bundle_hash"]
-    assert bundle["signature"]
-    assert bundle["payloads"][0]["payload"]["session_id"] == 7
-    assert payload_hash(bundle["payloads"][0]["payload"]) == bundle["entries"][0][
-        "record_payload_hash"
-    ]
-    # other session stayed out
-    assert all(p["payload"]["session_id"] == 7 for p in bundle["payloads"])
+    assert "payload" not in bundle["entries"][0]
+    assert bundle["chain_root_hash"] == bundle["entries"][0]["entry_hash"]
+    assert bundle["chain_tip_hash"] == bundle["entries"][-1]["entry_hash"]
+    assert isinstance(bundle["entries"][0]["record_ref_id"], str)
+    assert isinstance(bundle["entries"][0]["signature"], str)
+
+
+# ---------------------------------------------------------------------
+# Offline verify_attestation.py
+# ---------------------------------------------------------------------
+
+
+def test_verify_script_round_trip(tmp_path, ledger):
+    _append_n(ledger, 4, session_id=7)
+    bundle = ledger.export_attestation(7)
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    result = _run_verify(path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "VERDICT: PASS" in result.stdout
+
+
+def test_verify_script_payload_hash_tamper(tmp_path, ledger):
+    _append_n(ledger, 4, session_id=7)
+    bundle = ledger.export_attestation(7)
+    bundle["entries"][1]["record_payload_hash"] = "ab" * 32
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    result = _run_verify(path)
+    assert result.returncode == 1
+    assert "VERDICT: FAIL" in result.stdout
+    assert "broken_at_entry_id: 2" in result.stdout
+
+
+def test_verify_script_signature_tamper(tmp_path, ledger):
+    _append_n(ledger, 4, session_id=7)
+    bundle = ledger.export_attestation(7)
+    bundle["entries"][2]["signature"] = base64.b64encode(b"\x00" * 64).decode("ascii")
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    result = _run_verify(path)
+    assert result.returncode == 1
+    assert "broken_at_entry_id: 3" in result.stdout
+
+
+def test_verify_script_reordered_entries(tmp_path, ledger):
+    _append_n(ledger, 4, session_id=7)
+    bundle = ledger.export_attestation(7)
+    bundle["entries"][1], bundle["entries"][2] = (
+        bundle["entries"][2],
+        bundle["entries"][1],
+    )
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    result = _run_verify(path)
+    assert result.returncode == 1
+    # After swap [1, 3, 2, 4], entry 3 is the first whose prev_hash
+    # does not match the previous bundle entry.
+    assert "broken_at_entry_id: 3" in result.stdout
+
+
+def test_verify_script_has_zero_streamctx_imports():
+    source = VERIFY_SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+    assert all(not name.startswith("streamctx") for name in imported), imported
+    allowed_prefixes = (
+        "argparse",
+        "base64",
+        "hashlib",
+        "json",
+        "sys",
+        "cryptography",
+    )
+    for name in imported:
+        assert name.startswith(allowed_prefixes), name
