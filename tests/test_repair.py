@@ -142,7 +142,7 @@ def _msgs(*pairs):
     return [{"role": r, "content": c} for r, c in pairs]
 
 
-def _seed_session(storage, *, signal="recency", error_message="simulated failure"):
+def _seed_session(storage, *, signal="recency", error_message="context overflow"):
     """Seed a 2-call session whose dominant signal we can steer.
 
     Attribution scores the failing call itself at offset 0 (recency=1.0).
