@@ -20,7 +20,7 @@ import traceback
 
 from streamctx.storage import get_storage
 from streamctx.attribution import get_attribution_engine
-from streamctx.replay import get_replayer
+from streamctx.replayer import get_replayer
 
 
 def seed_sessions(n_sessions: int, steps: int) -> list[int]:

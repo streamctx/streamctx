@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import time
 
-from streamctx.replay import CounterfactualReplayer, get_replayer
+from streamctx.replayer import CounterfactualReplayer, get_replayer
 from streamctx.storage import get_storage
 
 

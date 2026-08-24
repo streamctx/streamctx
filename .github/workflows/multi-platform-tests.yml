@@ -37,7 +37,7 @@ jobs:
           python -c "from streamctx.storage import get_storage; print('storage OK')"
           python -c "from streamctx.tracker import get_tracker; print('tracker OK')"
           python -c "from streamctx.attribution import get_attribution_engine; print('attribution OK')"
-          python -c "from streamctx.replay import get_replayer; print('replay OK')"
+          python -c "from streamctx.replayer import get_replayer; print('replay OK')"
           python -c "from streamctx.compressor import compress_messages; print('compressor OK')"
 
       - name: Run test suite

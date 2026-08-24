@@ -1,17 +1,17 @@
-"""Tests for streamctx.replay (CounterfactualReplayer)."""
+"""Tests for streamctx.replayer (CounterfactualReplayer)."""
 
 import json
 import sqlite3
 
 import pytest
 
-from streamctx.replay import CounterfactualReplayer
+from streamctx.replayer import CounterfactualReplayer
 
 
 class _FakeStorage:
     """Minimal storage stand-in backed by a real SQLite file.
 
-    Mirrors the subset of the real storage API that replay.py relies on:
+    Mirrors the subset of the real storage API that replayer.py relies on:
     ``self.storage._connect()`` must return something usable as a context
     manager whose ``.execute(sql, params).fetchall()`` rows support
     ``dict(row)``.

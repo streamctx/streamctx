@@ -26,6 +26,7 @@ __all__ = [
     "healing_stats",
     "scan",
     "context_diff",
+    "replay",
     "__version__",
 ]
 
@@ -162,11 +163,11 @@ def attribute_session(session_id: int) -> list:
 
 
 def replay(session_id: int, from_step: int, with_context=None, dry_run: bool = True, llm_fn=None, replace_step: bool = False):
-    from .replay import CounterfactualReplayer
+    from .replayer import CounterfactualReplayer
     return CounterfactualReplayer().replay(session_id, from_step, with_context=with_context, dry_run=dry_run, llm_fn=llm_fn, replace_step=replace_step)
 
 def list_checkpoints(session_id: int) -> list:
-    from .replay import CounterfactualReplayer
+    from .replayer import CounterfactualReplayer
     return CounterfactualReplayer().list_checkpoints(session_id)
 
 

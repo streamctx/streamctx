@@ -28,7 +28,7 @@ import streamlit as st
 
 import streamctx
 from streamctx.attribution import get_attribution_engine
-from streamctx.replay import CounterfactualReplayer
+from streamctx.replayer import CounterfactualReplayer
 from streamctx.storage import get_storage
 
 # ---------------------------------------------------------------------------
@@ -631,11 +631,8 @@ def _build_capability_extras(result: dict[str, Any]) -> dict[str, Any]:
         from_step = max(at_or_before) if at_or_before else step_numbers[0]
 
     try:
-        # Workaround: streamctx.replay is overwritten by the replay submodule
-        # after list_checkpoints() does `from .replay import ...` (SDK namespace
-        # collision). Calling streamctx.replay() then raises
-        # TypeError: 'module' object is not callable. Use the class until the
-        # core package stops shadowing the public function.
+        # Public streamctx.replay() is a function; CounterfactualReplayer lives
+        # in streamctx.replayer so the submodule cannot shadow it.
         replayed = CounterfactualReplayer().replay(
             int(session_id),
             from_step,

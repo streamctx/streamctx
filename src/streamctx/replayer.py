@@ -9,7 +9,7 @@ inject alternate context, and replay forward — either as a dry run
 
 Core API::
 
-    from streamctx.replay import CounterfactualReplayer
+    from streamctx.replayer import CounterfactualReplayer
 
     replayer = CounterfactualReplayer()
 
