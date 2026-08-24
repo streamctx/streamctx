@@ -13,15 +13,23 @@ A side-by-side evaluator demo of the real StreamCtx API:
   streamctx.attribution.get_attribution_engine().attribute_session(session_id)
 
 Run locally:
-    pip install streamlit streamctx
-    python -m streamlit run streamlit_demo_v3.py
+    pip install -r streamlit_requirements.txt
+    python -m streamlit run streamlit_demo.py
+
+Streamlit Community Cloud: main file is streamlit_demo.py; install from
+streamlit_requirements.txt (or repo-root requirements.txt). Session rows for
+the Capability Grid are written at runtime by the fake client (no live LLM
+calls) into STREAMCTX_HOME, defaulting to ./.streamctx_demo next to this file.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
@@ -30,6 +38,42 @@ import streamctx
 from streamctx.attribution import get_attribution_engine
 from streamctx.replay import CounterfactualReplayer
 from streamctx.storage import get_storage
+
+
+def _read_secret(name: str) -> str | None:
+    """Read KEY from Streamlit Cloud secrets, then the process environment."""
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    if value is None or str(value).strip() == "":
+        env = os.environ.get(name)
+        return env if env else None
+    return str(value)
+
+
+def _configure_demo_runtime() -> None:
+    """Use Cloud secrets / a repo-relative SQLite dir — never a machine home path."""
+    home = _read_secret("STREAMCTX_HOME")
+    dest = Path(home) if home else Path(__file__).resolve().parent / ".streamctx_demo"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        dest = Path(tempfile.gettempdir()) / "streamctx_demo"
+        dest.mkdir(parents=True, exist_ok=True)
+    os.environ["STREAMCTX_HOME"] = str(dest)
+
+    os.environ["STREAMCTX_BACKEND"] = _read_secret("STREAMCTX_BACKEND") or "sqlite"
+
+    supabase_url = _read_secret("SUPABASE_URL") or _read_secret("STREAMCTX_SUPABASE_URL")
+    supabase_key = _read_secret("SUPABASE_KEY") or _read_secret("STREAMCTX_SUPABASE_KEY")
+    if supabase_url:
+        os.environ["SUPABASE_URL"] = supabase_url
+    if supabase_key:
+        os.environ["SUPABASE_KEY"] = supabase_key
+
+
+_configure_demo_runtime()
 
 # ---------------------------------------------------------------------------
 # Scenario: AI coding agent fixing a failing pytest suite

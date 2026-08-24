@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 *.db
 output.txt
+.streamctx_demo/
+.streamlit/secrets.toml
