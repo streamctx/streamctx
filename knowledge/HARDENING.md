@@ -144,9 +144,63 @@ python -m pytest tests/ --tb=line -q
 
 Skipped: live OpenAI key test. Includes the new `tests/test_layer1_hardening.py` (13 cases).
 
-## Explicitly not done yet
+## Explicitly not done yet (as of Layer 1 close-out)
 
 - Layers 2-4 re-hardening / cross-layer wiring prompt
 - `deploy/streamlit-cloud` merge
 - Changing README / `__init__.py` compression percentage copy (knowledge doc records the measured numbers; code wins on algorithm)
 - Token-level SSE streaming (never the Layer 1 meaning of "real-time streaming")
+
+---
+
+# Layer 2 — Attribution Engine hardening
+
+Date: 2026-09-17
+SDK parent: `b3b17b7` on `cursor/layer1-core-sdk-hardening` (not merged to `main` in this pass). Layer 2 fixes are on `cursor/layer2-attribution-hardening`.
+
+No part of Layer 2 is gated behind a paid tier. `attribution.py` has no license check, paid flag, or hosted-only branch. Core detection stays MIT.
+
+## Senior-bar results against pre-fix code
+
+Judged against live `src/streamctx/attribution.py` before the structural change. Probe: `scripts/layer2_senior_bar_pre.py`. Same bar as Layer 1 (do not round "weak" up to "works"):
+
+| Case | Pre-fix verdict | What actually happened |
+| --- | --- | --- |
+| Determinism (same failure twice) | **PASS** | Identical confidence, breakdown, reason. Pure functions, `score > best_score` tie-break. |
+| Infra timeout after real drift | **PASS** | `is_non_content_failure` already ran first → `infra/non-content`, conf 0. Not a described-but-unshipped fix. |
+| Simultaneous compression+recency | **PASS** | 20 reruns, one outcome. Label was raw-max (compression 1.0 tied recency 1.0, insertion order). |
+| Zero-signal abstention | **PASS** | `unattributable`, conf 0. Gate existed (`CONTENT_SIGNAL_EPS = 1e-6`) but only blocked *exact* zeros. |
+| Adversarial confidence gaming | **FAIL** | Under-budget prompt, `reused_tokens=180/200`. Layer 1 compression did **not** fire (`orig=2`). Attributed `recency` conf 0.47 because offset-0 recency is always 1.0 and compression 0.9 lost the raw-max label. Layer 3 would have recency-repaired a fake signal. |
+| Tracker `persist_failure` zero tokens | **PARTIAL** | Real intercept path: success `input_tokens=40`, failure `0/0/waste=None`. Drift scored 0.7 (40→0), recency stole the label, conf 0.55. Not crash-free-wrong: it attributed a same-size follow-up. |
+| Compression did not fire | **FAIL** | 7-token prompt, `reused_tokens==input_tokens` (ContextDiffer overlap). Dominant `compression` conf 0.5. |
+| `classify_failure` location | **PASS** | Lives in `repair.py`, not `attribution.py`. Abstention **does** exist in shipped `attribution.py` (`UNATTRIBUTABLE_REASON`, `INFRA_NON_CONTENT_REASON`). Prior audits conflicted because they scanned different commits. |
+| 50-worker concurrent attribution | **PASS** | Shared `AttributionEngine`, 0 errors, 0 serial/concurrent mismatches. No mutable scoring state in `attribution.py`. |
+
+`classify_failure()` in Layer 3 already treated timeouts/401/429 as `infra_error`. The remaining holes were (1) using `reused_tokens` as compression, (2) treating persist-zeroed usage as drift, (3) writing offset recency into the why-label Layer 3 reads, (4) an epsilon gate instead of a derived floor, (5) forcing a three-bucket label on prompt-injection rows that also happened to be over budget.
+
+## Root-cause fixes (not one-test special cases)
+
+1. **Token shape from messages.** `_shape_tokens` prefers `compress_messages`'s `len//4` estimate on stored messages. Layer 1 `_persist_failure` zeros (`tracker.py:653-680`) are missing usage, not 100% drift. Waste flip requires both sides labeled (`attribution.py:137-172`).
+2. **Compression is Layer 1 replay.** `_compression_score` calls `compress_messages()` on the uncompressed request. Score 0 unless it would fire **and** numbers/stable IDs are actually dropped. `reused_tokens` is not a compression proxy (`attribution.py:195-220`).
+3. **Recency-as-why ≠ offset prior.** Ranking still uses offset recency (0.2). `signal_breakdown["recency"]` is Jaccard topic-shift with the original task still buried and ≥2 user turns (`attribution.py:234-266,459-462`). Confidence uses why-signals only (`attribution.py:472-484`), so the 0.2 offset floor cannot mint medium confidence by itself.
+4. **Derived abstention floor.** `CONTENT_SIGNAL_FLOOR = 0.15` (`attribution.py:50-62,285-289`). Replaces `1e-6`. Infra gate still runs first. Out-of-taxonomy needles (`prompt injection`, `jailbreak`, poisoned prompt) abstain as `unattributable` rather than force a bucket (`attribution.py:91-96,427-430`).
+
+## Proof vs still-assumed
+
+| Path | Proven? | How |
+| --- | --- | --- |
+| Infra-after-drift still infra | **Yes** | `tests/test_layer2_hardening.py::test_infra_timeout_after_real_drift_does_not_blame_drift` |
+| Zero-signal abstains | **Yes** | `test_zero_signal_abstains` |
+| Under-budget reuse is not COMPRESSION | **Yes** | `test_under_budget_reused_tokens_is_not_compression` |
+| Over-budget `$12.4` drop is COMPRESSION | **Yes** | `test_over_budget_fact_drop_is_compression` |
+| `ACME-9917` kept ⇒ not COMPRESSION | **Yes** | `test_constraint_preserving_id_is_not_compression` |
+| Tracker zeroed tokens ⇒ not DRIFT | **Yes** | `test_tracker_zeroed_failure_tokens_are_not_drift` |
+| Prompt injection abstains | **Yes** | `test_prompt_injection_does_not_force_a_heuristic_bucket` |
+| 50-worker isolation | **Yes** | `test_concurrent_attribution_50_workers_no_contamination` |
+| Shadow-run current code vs `sessions.db` | **Yes** | 1,340 real failed rows. **1,331** known non-content correctly `infra/non-content` (0 misattributed). 9 prompt-injection `unattributable`. Do not reuse 1,264. |
+| Full suite | **Yes** | `python -m pytest tests/ --tb=line -q` → **190 passed, 1 skipped** |
+| Same-length semantic drift without a token jump | **Still assumed / weak** | No embedding/diff of message text beyond Jaccard recency and token shape. |
+| Layer 2 → Layer 3 import of `classify_failure` | **Debt** | Not moved; Layer 3 out of scope. |
+| `deploy/streamlit-cloud` / Layer 1 merge to `main` | **Not this pass** | Explicitly out of scope. |
+
+Layer 3 product code was not edited. `tests/test_repair.py` seeders were updated so they construct real drift/compression/recency mechanisms; the repair API is unchanged.
