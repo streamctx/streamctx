@@ -4,7 +4,14 @@ When a content-quality failure is persisted (model replied, but the
 response was flagged bad — ``error_message`` empty/None), schedule a
 ``verify_fix(dry_run=True)`` in a background thread and append the
 result to ``shadow_repair_log``.  Exceptions are swallowed so agents
-never see this path.
+never see this path.  Repairs are never applied to the live session.
+
+Layer 3 is MIT core SDK. No paid flag, license check, or hosted gate.
+
+Cap: at most one log row per failed call, and at most
+``MAX_SHADOW_REPAIRS_PER_SESSION`` verify_fix runs per session (equal to
+Layer 2 ``DEFAULT_LOOKBACK``). Further failures insert a single
+``needs_human_review`` give-up row and stop.
 """
 
 from __future__ import annotations
@@ -15,8 +22,18 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from .attribution import DEFAULT_LOOKBACK
+
 _shadow_lock = threading.Lock()
 _shadow_threads: list[threading.Thread] = []
+
+# One lookback window of auto-repairs. More is a loop, not a new cause.
+MAX_SHADOW_REPAIRS_PER_SESSION = DEFAULT_LOOKBACK
+SHADOW_IN_PROGRESS = "in-progress"
+SHADOW_GIVE_UP_REASON = (
+    "needs_human_review: session repair attempt cap reached "
+    f"({MAX_SHADOW_REPAIRS_PER_SESSION})"
+)
 
 
 def _env_flag(name: str, default: str = "1") -> bool:
@@ -63,6 +80,7 @@ def maybe_schedule_shadow_repair(
     thread.start()
     with _shadow_lock:
         _shadow_threads.append(thread)
+        _shadow_threads[:] = [t for t in _shadow_threads if t.is_alive()]
 
 
 def wait_for_shadow_repair(timeout: float = 10.0) -> None:
@@ -94,12 +112,52 @@ def _run_shadow_repair(
     from .storage import get_storage
 
     store = storage if storage is not None else get_storage()
+    begin = getattr(store, "begin_shadow_repair", None)
+    row_id = None
+    if begin is not None:
+        row_id = begin(int(session_id), int(failed_call_id))
+        if row_id is None:
+            return
+
     engine = VerifiedRepairEngine(storage=store)
-    result = engine.verify_fix(
-        session_id=session_id,
-        failed_call_id=failed_call_id,
-        dry_run=True,
-    )
+    try:
+        result = engine.verify_fix(
+            session_id=session_id,
+            failed_call_id=failed_call_id,
+            dry_run=True,
+        )
+    except Exception:
+        finalize = getattr(store, "finalize_shadow_repair_log", None)
+        if finalize is not None and row_id is not None:
+            finalize(
+                row_id,
+                attribution_reason="shadow repair failed; original session left untouched",
+                dominant_signal=None,
+                fix_candidate={},
+                resolved=False,
+                dry_run=True,
+                applied=False,
+                needs_human_review=True,
+            )
+        elif getattr(store, "insert_shadow_repair_log", None) is not None and row_id is None:
+            pass
+        return
+
+    finalize = getattr(store, "finalize_shadow_repair_log", None)
+    if finalize is not None and row_id is not None:
+        finalize(
+            row_id,
+            attribution_reason=result.reason,
+            dominant_signal=result.dominant_signal,
+            fix_candidate=result.fix_candidate,
+            resolved=result.resolved,
+            dry_run=result.dry_run,
+            applied=result.applied,
+            needs_human_review=result.needs_human_review,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        return
+
     insert = getattr(store, "insert_shadow_repair_log", None)
     if insert is None:
         return
@@ -110,6 +168,10 @@ def _run_shadow_repair(
         dominant_signal=result.dominant_signal,
         fix_candidate=result.fix_candidate,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        resolved=result.resolved,
+        dry_run=result.dry_run,
+        applied=result.applied,
+        needs_human_review=result.needs_human_review,
     )
 
 

@@ -5,6 +5,16 @@ Orchestrates AttributionEngine + CounterfactualReplayer into a single
 fix candidate, replay with the fix injected, and attest whether the
 original failure condition is gone.
 
+Layer 3 is MIT-licensed core SDK logic. Nothing in this module is gated
+on a paid tier, license check, or hosted-only flag. ``classify_failure()``
+keeps its binary ``infra_error`` / ``content_error`` contract so Layer 2's
+``is_non_content_failure()`` wrapper is not silently broken.
+
+``verify_fix()`` is counterfactual: it never writes checkpoints or call
+rows. A live session is not mutated, even when ``resolved=True``. Shadow
+repair is dry-run only. Applying a candidate is out of band (human /
+caller), not automatic.
+
 This is the v1 verified-repair loop described in the StreamCtx design:
 attribution finds *where* and *why*, replay proves whether a candidate
 fix actually removes the failure.  Dry-run mode reconstructs the
@@ -41,13 +51,16 @@ Or via the factory::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from .attribution import AttributionEngine, AttributionResult
+from .attribution import AttributionEngine, AttributionResult, DEFAULT_LOOKBACK
+from .compressor import _message_text, compress_messages
 from .replay import CounterfactualReplayer, ReplayResult
 from .storage import get_storage
 
@@ -167,6 +180,31 @@ _SIGNAL_STRATEGY = {
     "recency": "resurface",
 }
 
+# One Layer-2 lookback window of auto-repairs. More than that in a session
+# is the same cause recurring, not a new one — give up to human review.
+MAX_REPAIR_ATTEMPTS_PER_SESSION = DEFAULT_LOOKBACK
+# Live llm_fn hang must not block the caller indefinitely. 30s is above a
+# slow free-tier completion and below a stuck socket.
+REPAIR_LLM_TIMEOUT_S = 30.0
+
+INVENTED_CORRECT_VALUE = (
+    "Rejected: correct_value is not present in session evidence "
+    "(circular or invented verification)."
+)
+ECHOED_INJECTION = (
+    "Rejected: replay echoed the repair injection rather than answering "
+    "from restored context."
+)
+NEEDS_HUMAN_REVIEW_LOOP = (
+    "Repair attempt cap reached for this session; routing to human review."
+)
+
+# Dollar amounts, decimals, years/long ids, and stable IDs. Lone filler
+# indexes ("0", "10") are not restore-worthy facts.
+_REPAIR_FACT_RE = re.compile(
+    r"\$\d+(?:\.\d+)?|\d+\.\d+|\d{4,}|[A-Z]{2,}[-_][A-Z0-9]{2,}"
+)
+
 
 @dataclass
 class RepairResult:
@@ -204,6 +242,12 @@ class RepairResult:
     correct_value:
         The known-good fact that must appear in the new reply for
         ``resolved=True`` (string or list of required substrings).
+    applied:
+        Always ``False`` from ``verify_fix()``. Layer 3 never writes the
+        candidate into the live session.
+    needs_human_review:
+        True when auto-repair must stop (unfixable, unverifiable, timeout,
+        missing root cause, empty compression candidate).
     """
 
     session_id: int
@@ -217,6 +261,8 @@ class RepairResult:
     dry_run: bool = True
     reason: str = ""
     correct_value: str | list[str] | None = None
+    applied: bool = False
+    needs_human_review: bool = False
 
 
 class VerifiedRepairEngine:
@@ -237,6 +283,7 @@ class VerifiedRepairEngine:
     ) -> None:
         self.storage = storage or get_storage()
         self.evidence = evidence
+        self.llm_timeout_s = REPAIR_LLM_TIMEOUT_S
         self.attribution = attribution_engine or AttributionEngine(
             storage=self.storage, evidence=evidence
         )
@@ -328,6 +375,7 @@ class VerifiedRepairEngine:
                 failure_condition=failure_condition,
                 dry_run=dry_run,
                 extra_proof={"reason": attribution.reason},
+                needs_human_review=True,
             )
 
         root_messages = self._call_messages(session_id, attribution.root_cause_call_id)
@@ -344,31 +392,62 @@ class VerifiedRepairEngine:
             from_step=from_step,
             with_context=fix_candidate,
         )
+        pre_repair = self._checkpoint_snapshot(
+            from_step, before_after_diff.get("original_messages") or []
+        )
+
+        live_fn = llm_fn
+        if not dry_run and llm_fn is not None:
+            live_fn = _llm_fn_with_timeout(llm_fn, self.llm_timeout_s)
 
         replay_result = self.replayer.replay(
             session_id=session_id,
             from_step=from_step,
             with_context=fix_candidate,
             dry_run=dry_run,
-            llm_fn=llm_fn,
+            llm_fn=live_fn,
         )
 
         unfixable = is_unfixable_content_failure(
             self._parse_messages(failed_call.get("messages_json") if failed_call else None)
         )
+        replay_error = _replay_had_error(replay_result)
+        empty_compression = (
+            dominant == "compression" and not self._candidate_text(fix_candidate).strip()
+        )
 
         if dry_run:
             resolved = False
             confidence_delta = 0.0
-            reason = UNFIXABLE_CONTENT if unfixable else attribution.reason
+            if unfixable:
+                reason = UNFIXABLE_CONTENT
+            elif empty_compression:
+                reason = "No dropped facts to restore — compression candidate empty."
+            else:
+                reason = attribution.reason
+            needs_human = unfixable or empty_compression or replay_error
         else:
             if unfixable:
-                # Do not treat a paraphrased (or invented) reply as a fix.
                 resolved = False
                 reason = UNFIXABLE_CONTENT
+                needs_human = True
+            elif replay_error:
+                resolved = False
+                reason = "Repair replay failed or timed out; original session left untouched."
+                needs_human = True
+            elif empty_compression:
+                resolved = False
+                reason = "No dropped facts to restore — compression candidate empty."
+                needs_human = True
             else:
-                resolved = self._correct_value_restored(correct_value, replay_result)
-                reason = attribution.reason
+                resolved, verify_reason = self._independent_verification(
+                    correct_value=correct_value,
+                    replay_result=replay_result,
+                    fix_candidate=fix_candidate,
+                    session_id=session_id,
+                )
+                reason = verify_reason or attribution.reason
+                needs_human = (not resolved) and bool(verify_reason)
             confidence_delta = self._confidence_delta(attribution.confidence, resolved)
 
         proof = self._attestation(
@@ -385,6 +464,9 @@ class VerifiedRepairEngine:
             failure_class=failure_class,
             unfixable_content=unfixable,
             correct_value=correct_value,
+            applied=False,
+            needs_human_review=needs_human,
+            pre_repair_checkpoint=pre_repair,
         )
 
         return self._finish(
@@ -400,6 +482,8 @@ class VerifiedRepairEngine:
                 dry_run=dry_run,
                 reason=reason,
                 correct_value=correct_value,
+                applied=False,
+                needs_human_review=needs_human,
             )
         )
 
@@ -415,23 +499,27 @@ class VerifiedRepairEngine:
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """Build an injectable fix from the dominant attribution signal.
 
-        compression → re-inject facts from the earliest uncompressed call
+        compression → re-inject facts Layer 1 ``compress_messages()`` would
+                     drop from the *attributed* uncompressed request
         drift       → re-anchor to the original task framing (not the drifted step)
         recency     → re-surface the earlier assigned task (not the latest tangent)
+
+        Compression must not use the earliest call: that re-injects stale
+        framing (Lyon) that a later uncompressed window had already replaced
+        (Phoenix / $12.4). Unknown signals do not silently fall through to
+        a compression candidate.
         """
         earliest = (
             self._earliest_call_messages(session_id) if session_id is not None else []
         )
-        source = earliest or messages
 
         if signal == "compression":
-            return self._fix_compression_dedupe(source)
+            return self._fix_compression_dedupe(messages)
         if signal == "drift":
-            return self._fix_drift_reanchor(source)
+            return self._fix_drift_reanchor(earliest or messages)
         if signal == "recency":
-            return self._fix_recency_resurface(source)
-
-        return self._fix_compression_dedupe(source)
+            return self._fix_recency_resurface(earliest or messages)
+        return {}
 
     def _earliest_call_messages(self, session_id: int) -> list[dict[str, Any]]:
         """Known-good framing: the first call in the session, not the failure."""
@@ -448,24 +536,57 @@ class VerifiedRepairEngine:
                 return content
         return ""
 
+    @staticmethod
+    def _fact_terms(text: str) -> set[str]:
+        return {m.group(0) for m in _REPAIR_FACT_RE.finditer(text or "")}
+
+    def _dropped_source_snippets(
+        self, uncompressed: list[dict[str, Any]]
+    ) -> list[str]:
+        """Sentences from the uncompressed request that compression would drop."""
+        if not uncompressed:
+            return []
+        compressed, orig, comp = compress_messages(uncompressed)
+        if orig <= 0 or orig == comp:
+            return []
+        orig_blob = " ".join(_message_text(m) for m in uncompressed)
+        comp_blob = " ".join(_message_text(m) for m in compressed)
+        dropped = {
+            fact
+            for fact in self._fact_terms(orig_blob)
+            if fact.lower() not in comp_blob.lower()
+        }
+        if not dropped:
+            return []
+        snippets: list[str] = []
+        seen: set[str] = set()
+        for msg in uncompressed:
+            text = _message_text(msg).strip()
+            if not text:
+                continue
+            for clip in _windows_around_facts(text, dropped):
+                if clip in seen:
+                    continue
+                seen.add(clip)
+                snippets.append(clip)
+                if len(snippets) >= 8:
+                    return snippets
+        return snippets
+
     def _fix_compression_dedupe(
-        self, earliest: list[dict[str, Any]]
+        self, uncompressed: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        excerpts: list[str] = []
-        for msg in earliest:
-            if msg.get("role") in ("system", "user"):
-                content = str(msg.get("content") or "").strip()
-                if content:
-                    excerpts.append(content[:400])
-        source = "\n".join(excerpts)
+        snippets = self._dropped_source_snippets(uncompressed)
+        if not snippets:
+            return {}
         body = (
             "[STREAMCTX REPAIR — DEDUPE] "
             "Prior context was heavily reused or compressed. "
             "Restore facts from the uncompressed source below. "
-            "Do not invent replacements for dropped figures or names."
+            "Do not invent replacements for dropped figures or names.\n"
+            "Known-good source:\n"
+            + "\n".join(snippets)
         )
-        if source:
-            body = f"{body}\nKnown-good source:\n{source}"
         return {"role": "system", "content": body}
 
     def _fix_drift_reanchor(
@@ -539,23 +660,42 @@ class VerifiedRepairEngine:
     def _step_for_call(self, session_id: int, call_id: int) -> int:
         """Map a ``calls.id`` onto a checkpoint ``step_number``.
 
-        Checkpoints are stored in call order.  We use the checkpoint at
-        the same chronological index as the call when one exists,
-        otherwise fall back to a 1-based index (tracker ``step_counter``
-        increments after each call).
+        Layer 1 persists failures to ``calls`` only — they do not move
+        the resume checkpoint. Pairing call ordinal with checkpoint
+        ordinal therefore mis-maps a failure that sits between two
+        successes. Successes consume checkpoints in order; failures
+        replay from the last success. When tests/seeds store one
+        checkpoint per call (including the failed row), fall back to a
+        1:1 zip so content-quality rows that *were* checkpointed still
+        replay from their own step.
         """
         calls = self.storage.get_calls_for_session(session_id)
-        index_by_id = {int(row["id"]): idx for idx, row in enumerate(calls)}
-        idx = index_by_id.get(int(call_id))
-        if idx is None:
-            return 0
-
         checkpoints = self.replayer.list_checkpoints(session_id)
-        if checkpoints and 0 <= idx < len(checkpoints):
+        if not checkpoints:
+            index_by_id = {int(row["id"]): idx for idx, row in enumerate(calls)}
+            idx = index_by_id.get(int(call_id))
+            return 0 if idx is None else idx + 1
+
+        if len(checkpoints) == len(calls):
+            index_by_id = {int(row["id"]): idx for idx, row in enumerate(calls)}
+            idx = index_by_id.get(int(call_id))
+            if idx is None:
+                return int(checkpoints[-1]["step_number"])
             return int(checkpoints[idx]["step_number"])
-        if checkpoints:
-            return int(checkpoints[-1]["step_number"])
-        return idx + 1
+
+        last_success_step = int(checkpoints[0]["step_number"])
+        ckpt_i = 0
+        mapped: dict[int, int] = {}
+        for row in calls:
+            cid = int(row["id"])
+            if not row.get("failed"):
+                if ckpt_i < len(checkpoints):
+                    last_success_step = int(checkpoints[ckpt_i]["step_number"])
+                    ckpt_i += 1
+                mapped[cid] = last_success_step
+            else:
+                mapped[cid] = last_success_step
+        return mapped.get(int(call_id), last_success_step)
 
     def _load_call(
         self, session_id: int, call_id: int
@@ -635,6 +775,81 @@ class VerifiedRepairEngine:
         haystack = self._fold_text(combined)
         return all(self._fold_text(v) in haystack for v in values)
 
+    def _session_evidence_text(self, session_id: int) -> str:
+        parts: list[str] = []
+        for row in self.storage.get_calls_for_session(session_id):
+            for msg in self._parse_messages(row.get("messages_json")):
+                text = str(msg.get("content") or "")
+                if text.strip():
+                    parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _candidate_text(fix_candidate: dict[str, Any] | list[dict[str, Any]]) -> str:
+        if isinstance(fix_candidate, dict):
+            items = [fix_candidate]
+        else:
+            items = list(fix_candidate or [])
+        return "\n".join(str(m.get("content") or "") for m in items if isinstance(m, dict))
+
+    def _is_injection_echo(
+        self,
+        replay_result: ReplayResult,
+        fix_candidate: dict[str, Any] | list[dict[str, Any]],
+    ) -> bool:
+        reply = self._fold_text(self._replay_text(replay_result))
+        if "[streamctx repair" in reply:
+            return True
+        inj = self._fold_text(self._candidate_text(fix_candidate))
+        if not reply or not inj or len(reply) < 80:
+            return False
+        reply_words = set(reply.split())
+        inj_words = set(inj.split())
+        if not reply_words:
+            return False
+        return (len(reply_words & inj_words) / len(reply_words)) >= 0.85
+
+    def _independent_verification(
+        self,
+        correct_value: str | list[str] | None,
+        replay_result: ReplayResult,
+        fix_candidate: dict[str, Any] | list[dict[str, Any]],
+        session_id: int,
+    ) -> tuple[bool, str]:
+        """Verify the reply against session evidence, not the attribution signal.
+
+        Presence of ``correct_value`` in the replay is necessary but not
+        sufficient: the value must already exist in stored session messages
+        (so an LLM echo of an invented string cannot pass), and the reply
+        must not be a copy of the injection note.
+        """
+        if not self._correct_value_restored(correct_value, replay_result):
+            return False, ""
+        values = (
+            [correct_value]
+            if isinstance(correct_value, str)
+            else list(correct_value or [])
+        )
+        values = [str(v).strip() for v in values if str(v).strip()]
+        evidence = self._fold_text(self._session_evidence_text(session_id))
+        for value in values:
+            if self._fold_text(value) not in evidence:
+                return False, INVENTED_CORRECT_VALUE
+        if self._is_injection_echo(replay_result, fix_candidate):
+            return False, ECHOED_INJECTION
+        return True, ""
+
+    @staticmethod
+    def _checkpoint_snapshot(
+        from_step: int, original_messages: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        encoded = json.dumps(original_messages, sort_keys=True, default=str).encode()
+        return {
+            "from_step": from_step,
+            "message_count": len(original_messages),
+            "fingerprint": hashlib.sha256(encoded).hexdigest()[:16],
+        }
+
     @staticmethod
     def _confidence_delta(before: float, resolved: bool) -> float:
         if resolved:
@@ -651,6 +866,7 @@ class VerifiedRepairEngine:
         failure_condition: str,
         dry_run: bool,
         extra_proof: Optional[dict[str, Any]] = None,
+        needs_human_review: bool = True,
     ) -> RepairResult:
         proof = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -668,6 +884,8 @@ class VerifiedRepairEngine:
             "attribution_confidence": attribution.confidence,
             "attribution_reason": attribution.reason,
             "failure_class": "content_error",
+            "applied": False,
+            "needs_human_review": needs_human_review,
         }
         if extra_proof:
             proof.update(extra_proof)
@@ -683,6 +901,8 @@ class VerifiedRepairEngine:
                 proof=proof,
                 dry_run=dry_run,
                 reason=str((extra_proof or {}).get("reason") or attribution.reason),
+                applied=False,
+                needs_human_review=needs_human_review,
             )
         )
 
@@ -708,6 +928,8 @@ class VerifiedRepairEngine:
             "dry_run": dry_run,
             "before_after_diff": {},
             "reason": INFRA_NOT_REPAIRABLE,
+            "applied": False,
+            "needs_human_review": False,
         }
         return self._finish(
             RepairResult(
@@ -721,6 +943,8 @@ class VerifiedRepairEngine:
                 proof=proof,
                 dry_run=dry_run,
                 reason=INFRA_NOT_REPAIRABLE,
+                applied=False,
+                needs_human_review=False,
             )
         )
 
@@ -739,6 +963,9 @@ class VerifiedRepairEngine:
         failure_class: str = "content_error",
         unfixable_content: bool = False,
         correct_value: str | list[str] | None = None,
+        applied: bool = False,
+        needs_human_review: bool = False,
+        pre_repair_checkpoint: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         replay_texts: list[str] = []
         for response in replay_result.counterfactual_responses:
@@ -763,12 +990,80 @@ class VerifiedRepairEngine:
             "correct_value": correct_value,
             "resolved": resolved,
             "dry_run": dry_run,
+            "applied": applied,
+            "needs_human_review": needs_human_review,
+            "pre_repair_checkpoint": pre_repair_checkpoint or {},
             "before_after_diff": before_after_diff,
             "attribution_confidence": attribution.confidence,
             "attribution_reason": attribution.reason,
             "injection_summary": replay_result.injection_summary,
             "replay_texts": replay_texts,
         }
+
+
+def _windows_around_facts(
+    text: str, dropped: set[str], radius: int = 180
+) -> list[str]:
+    """Clip around dropped facts so a 400-char prefix cannot hide them."""
+    lowered = text.lower()
+    spans: list[tuple[int, int]] = []
+    for fact in dropped:
+        needle = fact.lower()
+        start = 0
+        while True:
+            idx = lowered.find(needle, start)
+            if idx < 0:
+                break
+            spans.append(
+                (max(0, idx - radius), min(len(text), idx + len(fact) + radius))
+            )
+            start = idx + max(len(fact), 1)
+    if not spans:
+        return []
+    spans.sort()
+    merged = [spans[0]]
+    for left, right in spans[1:]:
+        prev_l, prev_r = merged[-1]
+        if left <= prev_r:
+            merged[-1] = (prev_l, max(prev_r, right))
+        else:
+            merged.append((left, right))
+    return [text[left:right].strip() for left, right in merged]
+
+
+def _replay_had_error(replay_result: ReplayResult) -> bool:
+    for response in replay_result.counterfactual_responses:
+        if isinstance(response, dict) and response.get("error"):
+            return True
+    return False
+
+
+def _llm_fn_with_timeout(
+    llm_fn: Callable[[list[dict[str, Any]]], Any],
+    timeout_s: float,
+) -> Callable[[list[dict[str, Any]]], Any]:
+    def wrapped(messages: list[dict[str, Any]]) -> Any:
+        if timeout_s is None or timeout_s <= 0:
+            return llm_fn(messages)
+        box: dict[str, Any] = {}
+        errors: dict[str, BaseException] = {}
+
+        def run() -> None:
+            try:
+                box["result"] = llm_fn(messages)
+            except BaseException as exc:  # noqa: BLE001 — surface to caller
+                errors["e"] = exc
+
+        thread = threading.Thread(target=run, name="streamctx-repair-llm", daemon=True)
+        thread.start()
+        thread.join(timeout=timeout_s)
+        if thread.is_alive():
+            raise TimeoutError(f"repair llm_fn exceeded {timeout_s}s")
+        if "e" in errors:
+            raise errors["e"]
+        return box.get("result")
+
+    return wrapped
 
 
 def get_repair_engine() -> VerifiedRepairEngine:
