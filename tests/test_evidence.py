@@ -102,7 +102,9 @@ def test_verify_chain_filtered_slice(ledger):
     _append_n(ledger, 6)
     result = ledger.verify_chain(record_ref_id=103)
     assert result["valid"] is True
-    assert result["total_checked"] == 1
+    # Filter never weakens the walk — the chain is global.
+    assert result["total_checked"] == 6
+    assert result["matched_ref"] == 1
 
 
 def test_genesis_prev_hash_is_zero(ledger):
@@ -123,6 +125,13 @@ def test_update_and_delete_are_rejected(ledger):
         )
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute("DELETE FROM evidence_ledger WHERE entry_id = 1")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE evidence_payloads SET payload_json = ? WHERE entry_id = 1",
+            ("{}",),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM evidence_payloads WHERE entry_id = 1")
 
 
 # ---------------------------------------------------------------------
@@ -266,18 +275,23 @@ def test_export_attestation_schema(ledger):
     ledger.append_evidence("attribution", 999, _payload(0, session_id=8))
 
     bundle = ledger.export_attestation(7)
-    assert bundle["schema_version"] == "1.0"
+    assert bundle["schema_version"] == "1.1"
     assert bundle["issuer"] == "streamctx"
     assert bundle["session_id"] == "7"
     assert bundle["public_key_pem"].startswith("-----BEGIN PUBLIC KEY-----")
+    assert bundle["public_key_fingerprint"].startswith("sha256:")
     assert "payloads" not in bundle
     assert "payload" not in bundle
     assert len(bundle["entries"]) == 4
     assert "payload" not in bundle["entries"][0]
     assert bundle["chain_root_hash"] == bundle["entries"][0]["entry_hash"]
     assert bundle["chain_tip_hash"] == bundle["entries"][-1]["entry_hash"]
-    assert isinstance(bundle["entries"][0]["record_ref_id"], str)
+    assert isinstance(bundle["entries"][0]["record_ref_id"], int)
     assert isinstance(bundle["entries"][0]["signature"], str)
+    assert "repair_disposition" in bundle["entries"][0]
+    assert "applied" in bundle["entries"][0]
+    assert bundle["repair_summary"]["applied_count"] == 0
+    assert bundle["layer3_contract"]["verify_fix_never_applies"] is True
 
 
 # ---------------------------------------------------------------------
