@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import threading
 import weakref
 from collections import Counter
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from . import pricing
@@ -164,6 +166,41 @@ def _reset_sdk_patches() -> None:
         pass
 
 
+def _message_fingerprint(messages: list[dict[str, str]]) -> str:
+    payload = json.dumps(messages, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _cached_response_from_row(row: dict[str, Any]) -> Any:
+    text = row.get("response_text") or ""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+        content=text,
+        usage=SimpleNamespace(
+            prompt_tokens=int(row.get("input_tokens") or 0),
+            completion_tokens=int(row.get("output_tokens") or 0),
+        ),
+        _streamctx_cached=True,
+    )
+
+
+def _response_text(response: Any, provider: str) -> str:
+    try:
+        text = response.choices[0].message.content
+        if text:
+            return str(text)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    if provider == "anthropic":
+        try:
+            return _extract_text(getattr(response, "content", ""))
+        except (AttributeError, TypeError):
+            pass
+    if isinstance(response, dict):
+        return str(response.get("content") or response.get("text") or "")
+    return ""
+
+
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
@@ -226,6 +263,8 @@ class CallRecord:
     failed: bool = False
     healed: bool = False
     error_message: Optional[str] = None
+    message_fingerprint: Optional[str] = None
+    response_text: Optional[str] = None
 
 
 @dataclass
@@ -333,7 +372,32 @@ class LLMTracker:
         )
 
     def resume(self, session_id: int) -> list[dict[str, str]]:
-        return self.state.storage.resume_from_checkpoint(session_id)
+        """Restore tracker state from the latest *valid* checkpoint.
+
+        Returns the conversation snapshot (including the last assistant
+        reply when one was stored) so the next ``create()`` is step N+1,
+        not a replay of step N. Corrupt checkpoints are skipped.
+        """
+        ckpt = None
+        try:
+            ckpt = self.state.storage.get_latest_valid_checkpoint(session_id)
+        except Exception:
+            ckpt = None
+        if ckpt is None:
+            try:
+                return self.state.storage.resume_from_checkpoint(session_id)
+            except Exception:
+                return []
+        messages = list(ckpt.get("messages") or [])
+        with self.state._lock:
+            self.state.session_id = session_id
+            self.state.step_counter = int(ckpt.get("step_number") or 0)
+            self.state._last_messages = list(messages)
+            self.state.active = True
+        self.session_id = session_id
+        if messages:
+            self.healer.record_success(messages, None)
+        return messages
 
     def get_session_id(self) -> Optional[int]:
         return self.state.session_id
@@ -470,58 +534,59 @@ class LLMTracker:
             user_msgs = _normalize_messages(kwargs.get("messages"))
             messages.extend(user_msgs)
 
+        fingerprint = _message_fingerprint(messages)
+        cached = self._lookup_completed_step(fingerprint, messages)
+        if cached is not None:
+            return cached
+
         reused, waste = self.diff.analyze(messages)
 
-        # --- NEW: actually run compression to get real token savings ---
         from .compressor import compress_messages
-        _, orig_tok, comp_tok = compress_messages(messages)
+
+        outbound = kwargs.get("messages")
+        compress_source = outbound if isinstance(outbound, list) and outbound else messages
+        compressed, orig_tok, comp_tok = compress_messages(compress_source)
         compression_savings = max(0, orig_tok - comp_tok)
         context_savings_tokens = compression_savings + reused
+        if (
+            compression_savings > 0
+            and isinstance(outbound, list)
+            and compressed is not outbound
+        ):
+            kwargs["messages"] = compressed
 
-        # Try LLM call — self-heal on failure
         call_failed = False
         call_healed = False
         call_error_message: Optional[str] = None
         try:
             response = fn()
-            self.healer.record_success(messages, response)
         except Exception as e:
-            call_failed = True
-            call_error_message = str(e)[:500]  # keep it bounded
+            call_error_message = str(e)[:500]
             self.healer.record_failure()
-            if self.healer.can_heal():
-                call_healed = True
-                recovery_msgs = self.healer.get_recovery_messages(messages)
-                with self.state._lock:
-                    self.state._last_messages = recovery_msgs
-
-            # Persist the failure itself before re-raising, so the
-            # Attribution Engine has a record to analyze.
-            failure_record = CallRecord(
-                provider=provider,
-                model=model,
-                input_tokens=0,
-                output_tokens=0,
-                cost=0.0,
-                reused_tokens=0,
-                waste_category=None,
-                messages=messages,
-                failed=call_failed,
-                healed=call_healed,
-                error_message=call_error_message,
+            self.healer.ingest_valid_context(
+                self.state.storage, self.state.session_id
             )
-            self._persist(failure_record)
-            with self.state._lock:
-                self.state.call_count += 1
-                self.state.step_counter += 1
-                self.state._last_messages = list(messages)
-                step = self.state.step_counter
-            if self.state.session_id is not None:
-                self.state.storage.save_checkpoint(
-                    self.state.session_id, step, messages
-                )
-            raise
-      
+            self._persist_failure(
+                provider, model, messages, fingerprint, call_error_message, healed=False
+            )
+            if not self.healer.can_heal():
+                raise
+            recovery_msgs = self.healer.get_recovery_messages(messages)
+            if "messages" in kwargs:
+                kwargs["messages"] = recovery_msgs
+            try:
+                response = fn()
+            except Exception:
+                raise
+            call_healed = True
+            messages = _normalize_messages(kwargs.get("messages")) or recovery_msgs
+            fingerprint = _message_fingerprint(messages)
+
+        self.healer.record_success(messages, response)
+        reply = _response_text(response, provider)
+        conversation = list(messages)
+        if reply:
+            conversation.append({"role": "assistant", "content": reply})
 
         input_tokens, output_tokens = self._extract_usage(
             response, provider, messages, kwargs
@@ -539,19 +604,11 @@ class LLMTracker:
             messages=messages,
             failed=call_failed,
             healed=call_healed,
-            error_message=call_error_message,
+            error_message=call_error_message if call_healed else None,
+            message_fingerprint=fingerprint,
+            response_text=reply,
         )
-        self._persist(record)
-
-        with self.state._lock:
-            self.state.step_counter += 1
-            self.state._last_messages = list(messages)
-            step = self.state.step_counter
-
-        if self.state.session_id is not None:
-            self.state.storage.save_checkpoint(
-                self.state.session_id, step, messages
-            )
+        self._persist_success(record, conversation)
 
         with self.state._lock:
             self.state.call_count += 1
@@ -567,23 +624,140 @@ class LLMTracker:
 
         return response
 
+    def _lookup_completed_step(
+        self,
+        fingerprint: str,
+        messages: list[dict[str, str]],
+    ) -> Any:
+        """Skip provider re-entry when the caller re-submits a completed snapshot.
+
+        Resume returns the post-response conversation (including the assistant
+        reply). Re-sending that snapshot must not re-invoke the provider or
+        any tool side effect attached to create(). A second live call with
+        the *same request* (no assistant tail) is a new step and is not skipped.
+        """
+        if self.state.session_id is None:
+            return None
+        storage = self.state.storage
+        try:
+            latest = storage.get_latest_valid_checkpoint(self.state.session_id)
+            if not latest or latest.get("messages") != messages:
+                return None
+            row = storage.get_last_successful_call(self.state.session_id)
+            if row is None:
+                return None
+            return _cached_response_from_row(row)
+        except Exception:
+            return None
+
+    def _persist_failure(
+        self,
+        provider: str,
+        model: Optional[str],
+        messages: list[dict[str, str]],
+        fingerprint: str,
+        error_message: Optional[str],
+        healed: bool,
+    ) -> None:
+        """Record a failed call without moving the resume checkpoint."""
+        with self.state._lock:
+            self.state.call_count += 1
+        self._persist(
+            CallRecord(
+                provider=provider,
+                model=model,
+                input_tokens=0,
+                output_tokens=0,
+                cost=0.0,
+                reused_tokens=0,
+                waste_category=None,
+                messages=messages,
+                failed=True,
+                healed=healed,
+                error_message=error_message,
+                message_fingerprint=fingerprint,
+            )
+        )
+
+    def _persist_success(
+        self,
+        record: CallRecord,
+        conversation: list[dict[str, str]],
+    ) -> None:
+        with self.state._lock:
+            self.state.step_counter += 1
+            self.state._last_messages = list(conversation)
+            step = self.state.step_counter
+            session_id = self.state.session_id
+        if session_id is None:
+            return
+        persist_step = getattr(self.state.storage, "persist_step", None)
+        try:
+            if persist_step is not None:
+                persist_step(
+                    session_id=session_id,
+                    provider=record.provider,
+                    model=record.model,
+                    input_tokens=record.input_tokens,
+                    output_tokens=record.output_tokens,
+                    cost=record.cost,
+                    reused_tokens=record.reused_tokens,
+                    waste_category=record.waste_category,
+                    request_messages=record.messages,
+                    checkpoint_messages=conversation,
+                    step_number=step,
+                    failed=False,
+                    healed=record.healed,
+                    error_message=record.error_message,
+                    message_fingerprint=record.message_fingerprint,
+                    response_text=record.response_text,
+                    checkpoint_valid=True,
+                )
+            else:
+                self._persist(record)
+                self.state.storage.save_checkpoint(session_id, step, conversation)
+        except Exception:
+            # Provider already succeeded — do not drop the response on a
+            # storage failure. In-memory snapshot still lets the process resume.
+            return
+
     def _persist(self, record: CallRecord) -> None:
         if self.state.session_id is None:
             return
-        self.state.storage.record_call(
-            session_id=self.state.session_id,
-            provider=record.provider,
-            model=record.model,
-            input_tokens=record.input_tokens,
-            output_tokens=record.output_tokens,
-            cost=record.cost,
-            reused_tokens=record.reused_tokens,
-            waste_category=record.waste_category,
-            messages=record.messages,
-            failed=record.failed,
-            healed=record.healed,
-            error_message=record.error_message,
-        )
+        try:
+            self.state.storage.record_call(
+                session_id=self.state.session_id,
+                provider=record.provider,
+                model=record.model,
+                input_tokens=record.input_tokens,
+                output_tokens=record.output_tokens,
+                cost=record.cost,
+                reused_tokens=record.reused_tokens,
+                waste_category=record.waste_category,
+                messages=record.messages,
+                failed=record.failed,
+                healed=record.healed,
+                error_message=record.error_message,
+                message_fingerprint=record.message_fingerprint,
+                response_text=record.response_text,
+            )
+        except TypeError:
+            self.state.storage.record_call(
+                session_id=self.state.session_id,
+                provider=record.provider,
+                model=record.model,
+                input_tokens=record.input_tokens,
+                output_tokens=record.output_tokens,
+                cost=record.cost,
+                reused_tokens=record.reused_tokens,
+                waste_category=record.waste_category,
+                messages=record.messages,
+                failed=record.failed,
+                healed=record.healed,
+                error_message=record.error_message,
+            )
+        except Exception:
+            return
 
     def _extract_usage(
         self,

@@ -48,6 +48,7 @@ class SupabaseStorage:
         reused_tokens: int,
         waste_category: Optional[str],
         messages: list[dict[str, Any]],
+        **_ignored: Any,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         self.supabase.table("calls").insert(
@@ -70,6 +71,7 @@ class SupabaseStorage:
         session_id: int,
         step_number: int,
         messages: list[dict[str, Any]],
+        **_ignored: Any,
     ) -> None:
         """Save current messages as a checkpoint after each LLM call."""
         now = datetime.now(timezone.utc).isoformat()
@@ -101,12 +103,23 @@ class SupabaseStorage:
             "timestamp": row["timestamp"],
         }
 
+    def get_latest_valid_checkpoint(self, session_id: int) -> Optional[dict[str, Any]]:
+        return self.get_latest_checkpoint(session_id)
+
     def resume_from_checkpoint(self, session_id: int) -> list[dict[str, Any]]:
         """Return messages from the latest checkpoint to resume from."""
         result = self.get_latest_checkpoint(session_id)
         if result is None:
             return []
         return result["messages"]
+
+    def find_successful_call_by_fingerprint(
+        self, session_id: int, fingerprint: str
+    ) -> Optional[dict[str, Any]]:
+        return None
+
+    def get_last_successful_call(self, session_id: int) -> Optional[dict[str, Any]]:
+        return None
 
     def get_session_stats(self, session_id: int) -> dict[str, Any]:
         calls = (

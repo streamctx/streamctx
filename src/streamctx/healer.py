@@ -61,6 +61,23 @@ class SelfHealingEngine:
         except Exception:
             return
 
+    def ingest_valid_context(self, storage: Any, session_id: Optional[int]) -> None:
+        """Load the newest *valid* checkpoint, skipping corrupt rows.
+
+        In-memory success is preferred when present. Otherwise walk
+        checkpoints newest-first until one parses as a message list.
+        Two consecutive corrupt checkpoints must not block a third.
+        """
+        if self.can_heal() or storage is None or session_id is None:
+            return
+        try:
+            ckpt = storage.get_latest_valid_checkpoint(session_id)
+        except Exception:
+            return
+        messages = (ckpt or {}).get("messages") if ckpt else None
+        if messages:
+            self._last_valid_messages = list(messages)
+
     def can_heal(self) -> bool:
         """Check if we have valid context to recover from."""
         return len(self._last_valid_messages) > 0
@@ -78,7 +95,7 @@ class SelfHealingEngine:
         - Append the last user message from failed call
         """
         if not self._last_valid_messages:
-            return failed_messages
+            return list(failed_messages)
 
         # Get last user message from failed call
         last_user_msg = None
