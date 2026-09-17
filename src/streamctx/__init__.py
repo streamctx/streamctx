@@ -168,3 +168,14 @@ def replay(session_id: int, from_step: int, with_context=None, dry_run: bool = T
 def list_checkpoints(session_id: int) -> list:
     from .replay import CounterfactualReplayer
     return CounterfactualReplayer().list_checkpoints(session_id)
+
+
+def verify_fix(session_id: int, failed_call_id: int, llm_fn=None, dry_run: bool = True, correct_value=None):
+    from .repair import get_repair_engine
+    return get_repair_engine().verify_fix(
+        session_id,
+        failed_call_id,
+        llm_fn=llm_fn,
+        dry_run=dry_run,
+        correct_value=correct_value,
+    )

@@ -97,6 +97,34 @@ class SessionStorage:
                     ON calls(session_id);
                 CREATE INDEX IF NOT EXISTS idx_checkpoints_session_id
                     ON checkpoints(session_id);
+
+                CREATE TABLE IF NOT EXISTS shadow_repair_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    failed_call_id INTEGER NOT NULL,
+                    attribution_reason TEXT,
+                    dominant_signal TEXT,
+                    fix_candidate TEXT,
+                    timestamp TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_shadow_repair_session_id
+                    ON shadow_repair_log(session_id);
+
+                CREATE TABLE IF NOT EXISTS shadow_attribution_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    failed_call_id INTEGER NOT NULL,
+                    dominant_signal TEXT,
+                    confidence REAL,
+                    root_cause_call_id INTEGER,
+                    reason TEXT,
+                    error_message TEXT,
+                    failure_kind TEXT,
+                    signal_breakdown TEXT,
+                    timestamp TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_shadow_attribution_session_id
+                    ON shadow_attribution_log(session_id);
                 """
             )
             self._write_conn.commit()
@@ -138,7 +166,7 @@ class SessionStorage:
 
         now = datetime.now(timezone.utc).isoformat()
         with self._write_lock:
-            self._write_conn.execute(
+            cur = self._write_conn.execute(
                  """
                  INSERT INTO calls (
                      session_id, timestamp, provider, model,
@@ -156,6 +184,19 @@ class SessionStorage:
                  ),
              )
             self._write_conn.commit()
+            call_id = int(cur.lastrowid)
+        if failed:
+            try:
+                from .shadow import maybe_schedule_shadow_repair
+
+                maybe_schedule_shadow_repair(
+                    session_id=session_id,
+                    failed_call_id=call_id,
+                    error_message=error_message,
+                    storage=self,
+                )
+            except Exception:
+                pass
 
     def save_checkpoint(
         self,
@@ -266,6 +307,124 @@ class SessionStorage:
             finally:
                 self._return_read_conn(conn)
             return [dict(row) for row in rows]
+
+    def insert_shadow_repair_log(
+        self,
+        session_id: int,
+        failed_call_id: int,
+        attribution_reason: Optional[str],
+        dominant_signal: Optional[str],
+        fix_candidate: Any,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        from .shadow import serialize_fix_candidate
+
+        now = timestamp or datetime.now(timezone.utc).isoformat()
+        with self._write_lock:
+            self._write_conn.execute(
+                """
+                INSERT INTO shadow_repair_log (
+                    session_id, failed_call_id, attribution_reason,
+                    dominant_signal, fix_candidate, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    failed_call_id,
+                    attribution_reason,
+                    dominant_signal,
+                    serialize_fix_candidate(fix_candidate),
+                    now,
+                ),
+            )
+            self._write_conn.commit()
+
+    def get_shadow_repair_log(self, limit: Optional[int] = None) -> list[dict[str, Any]]:
+        conn = self._borrow_read_conn()
+        try:
+            sql = """
+                SELECT id, session_id, failed_call_id, attribution_reason,
+                       dominant_signal, fix_candidate, timestamp
+                FROM shadow_repair_log
+                ORDER BY id ASC
+            """
+            if limit is not None:
+                rows = conn.execute(sql + " LIMIT ?", (int(limit),)).fetchall()
+            else:
+                rows = conn.execute(sql).fetchall()
+        finally:
+            self._return_read_conn(conn)
+        return [dict(row) for row in rows]
+
+    def insert_shadow_attribution_log(
+        self,
+        session_id: int,
+        failed_call_id: int,
+        dominant_signal: Optional[str],
+        confidence: float,
+        root_cause_call_id: Optional[int] = None,
+        reason: Optional[str] = None,
+        error_message: Optional[str] = None,
+        failure_kind: Optional[str] = None,
+        signal_breakdown: Optional[dict[str, Any]] = None,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        now = timestamp or datetime.now(timezone.utc).isoformat()
+        if signal_breakdown is None:
+            breakdown_json = None
+        else:
+            try:
+                breakdown_json = json.dumps(signal_breakdown, ensure_ascii=False)
+            except (TypeError, ValueError):
+                breakdown_json = str(signal_breakdown)
+        with self._write_lock:
+            self._write_conn.execute(
+                """
+                INSERT INTO shadow_attribution_log (
+                    session_id, failed_call_id, dominant_signal, confidence,
+                    root_cause_call_id, reason, error_message, failure_kind,
+                    signal_breakdown, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    failed_call_id,
+                    dominant_signal,
+                    float(confidence),
+                    root_cause_call_id,
+                    reason,
+                    error_message,
+                    failure_kind,
+                    breakdown_json,
+                    now,
+                ),
+            )
+            self._write_conn.commit()
+
+    def get_shadow_attribution_log(
+        self, limit: Optional[int] = None
+    ) -> list[dict[str, Any]]:
+        conn = self._borrow_read_conn()
+        try:
+            sql = """
+                SELECT id, session_id, failed_call_id, dominant_signal,
+                       confidence, root_cause_call_id, reason, error_message,
+                       failure_kind, signal_breakdown, timestamp
+                FROM shadow_attribution_log
+                ORDER BY id ASC
+            """
+            if limit is not None:
+                rows = conn.execute(sql + " LIMIT ?", (int(limit),)).fetchall()
+            else:
+                rows = conn.execute(sql).fetchall()
+        finally:
+            self._return_read_conn(conn)
+        return [dict(row) for row in rows]
+
+    def clear_shadow_attribution_log(self) -> None:
+        with self._write_lock:
+            self._write_conn.execute("DELETE FROM shadow_attribution_log")
+            self._write_conn.commit()
 
 
 _storage_cache: dict[str, "SessionStorage"] = {}

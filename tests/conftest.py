@@ -16,7 +16,7 @@ import pytest
 def _streamctx_force_reset():
     yield
     try:
-        from streamctx.tracker import _trackers, _wrapped_clients
+        from streamctx.tracker import _reset_sdk_patches, _trackers, _wrapped_clients
     except ImportError:
         return
 
@@ -34,3 +34,4 @@ def _streamctx_force_reset():
         tracker.state._originals.clear()
 
     _wrapped_clients.clear()
+    _reset_sdk_patches()

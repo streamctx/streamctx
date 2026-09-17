@@ -1,8 +1,10 @@
 """StreamCtx Live Dashboard - reads real session/call data from SQLite."""
 
+import json
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -55,6 +57,51 @@ def get_checkpoints(conn, session_id: int) -> pd.DataFrame:
         conn,
         params=(session_id,),
     )
+
+
+def _evidence_db_path() -> Path:
+    base = Path(os.environ.get("STREAMCTX_HOME", Path.home() / ".streamctx"))
+    return base / "evidence_ledger.db"
+
+
+def get_session_evidence_summary(session_id: int) -> dict:
+    """Count this session's ledger entries and the latest tip hash.
+
+    Read-only query against evidence_ledger.db — does not export or verify.
+    """
+    empty = {"count": 0, "tip_hash": None}
+    db_path = _evidence_db_path()
+    if not db_path.exists():
+        return empty
+    try:
+        ev = sqlite3.connect(str(db_path))
+        ev.row_factory = sqlite3.Row
+        try:
+            count_row = ev.execute(
+                "SELECT COUNT(*) AS n FROM evidence_payloads WHERE session_id = ?",
+                (int(session_id),),
+            ).fetchone()
+            count = int(count_row["n"]) if count_row is not None else 0
+            tip_hash = None
+            if count:
+                tip_row = ev.execute(
+                    """
+                    SELECT e.entry_hash
+                    FROM evidence_ledger e
+                    JOIN evidence_payloads p ON p.entry_id = e.entry_id
+                    WHERE p.session_id = ?
+                    ORDER BY e.entry_id DESC
+                    LIMIT 1
+                    """,
+                    (int(session_id),),
+                ).fetchone()
+                if tip_row is not None:
+                    tip_hash = str(tip_row["entry_hash"])
+            return {"count": count, "tip_hash": tip_hash}
+        finally:
+            ev.close()
+    except sqlite3.Error:
+        return empty
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +231,56 @@ with st.expander("📋 Full Call Log", expanded=False):
         )
     else:
         st.info("No calls recorded for this session yet.")
+
+st.divider()
+
+# ---- Compliance bundle (this session only) ----
+st.subheader("🔒 Compliance Evidence")
+st.caption(f"Session #{selected_session} — tamper-evident attestation of attribution and repair records.")
+
+evidence_summary = get_session_evidence_summary(int(selected_session))
+evidence_count = int(evidence_summary["count"])
+tip_hash = evidence_summary["tip_hash"]
+tip_short = tip_hash[:8] if tip_hash else "—"
+
+info_col, action_col = st.columns([2, 1])
+with info_col:
+    st.markdown(f"**Evidence entries:** {evidence_count}")
+    st.markdown(f"**Chain tip:** `{tip_short}`")
+with action_col:
+    export_clicked = st.button("Export Compliance Bundle", use_container_width=True)
+
+if evidence_count == 0:
+    st.info("No compliance evidence recorded for this session yet.")
+elif export_clicked:
+    with st.spinner("Building compliance bundle..."):
+        try:
+            from streamctx.evidence import export_attestation
+
+            bundle = export_attestation(int(selected_session))
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            st.session_state["compliance_bundle"] = {
+                "session_id": int(selected_session),
+                "filename": f"compliance_bundle_{selected_session}_{stamp}.json",
+                "json": json.dumps(bundle, indent=2),
+            }
+        except Exception as exc:
+            st.session_state.pop("compliance_bundle", None)
+            st.error(f"Could not export the compliance bundle: {exc}")
+
+cached_bundle = st.session_state.get("compliance_bundle")
+if (
+    cached_bundle
+    and cached_bundle.get("session_id") == int(selected_session)
+    and evidence_count > 0
+):
+    st.download_button(
+        label="Download JSON bundle",
+        data=cached_bundle["json"],
+        file_name=cached_bundle["filename"],
+        mime="application/json",
+        use_container_width=True,
+    )
 
 conn.close()
 

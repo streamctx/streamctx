@@ -24,7 +24,8 @@ be replaced/augmented later, not to be the final word in accuracy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from .storage import get_storage
@@ -38,6 +39,27 @@ RECENCY_WEIGHT = 0.2
 # candidate root causes. Keeps the engine from blaming something that
 # happened too long ago to plausibly be related.
 DEFAULT_LOOKBACK = 5
+
+# Recency at offset 0 is a structural prior (always 1.0), not evidence.
+# If the winning candidate has no measurable drift or compression, abstain
+# rather than report the recency floor as a root cause.
+CONTENT_SIGNAL_EPS = 1e-6
+
+UNATTRIBUTABLE_REASON = "unattributable"
+INFRA_NON_CONTENT_REASON = "infra/non-content"
+
+# Extra non-content needles beyond Layer 3 classify_failure() (401/429/
+# invalid model/timeout/…).  Kept here so repair.classify_failure() can
+# still treat "simulated failure" as a content_error placeholder in
+# Layer 3 tests, while attribution refuses to blame a heuristic for it.
+_NON_CONTENT_EXTRA_RE = re.compile(
+    r"recursion depth|"
+    r"simulated failure|"
+    r"takes 1 argument|"
+    r"Completions\.create|"
+    r"missing 1 required positional argument",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -116,6 +138,42 @@ def _recency_score(offset: int, lookback: int) -> float:
     return max(0.0, 1.0 - (offset / (lookback + 1)))
 
 
+def is_non_content_failure(error_message: Optional[str]) -> bool:
+    """True for infra / SDK / load-test errors that are not content quality.
+
+    Reuses Layer 3 ``classify_failure()`` for API/config patterns, then
+    adds recursion-depth, simulated-failure, and SDK-signature needles
+    that classify_failure() still treats as content_error.
+    """
+    from .repair import classify_failure
+
+    if classify_failure(error_message) == "infra_error":
+        return True
+    if error_message is None:
+        return False
+    return bool(_NON_CONTENT_EXTRA_RE.search(str(error_message)))
+
+
+def _has_content_signal(breakdown: dict[str, float]) -> bool:
+    drift = float(breakdown.get("drift") or 0.0)
+    compression = float(breakdown.get("compression") or 0.0)
+    return max(drift, compression) > CONTENT_SIGNAL_EPS
+
+
+def _abstain(
+    session_id: int, failed_call_id: int, reason: str
+) -> AttributionResult:
+    return AttributionResult(
+        session_id=session_id,
+        failed_call_id=failed_call_id,
+        root_cause_call_id=None,
+        root_cause_step_offset=None,
+        confidence=0.0,
+        reason=reason,
+        signal_breakdown={},
+    )
+
+
 def _row_to_snapshot(row: dict[str, Any]) -> CallSnapshot:
     import json
 
@@ -151,9 +209,27 @@ class AttributionEngine:
     step, using the weighted heuristic described at module level.
     """
 
-    def __init__(self, storage: Any = None, lookback: int = DEFAULT_LOOKBACK) -> None:
+    def __init__(
+        self,
+        storage: Any = None,
+        lookback: int = DEFAULT_LOOKBACK,
+        evidence: Any = None,
+    ) -> None:
         self.storage = storage or get_storage()
         self.lookback = lookback
+        self.evidence = evidence
+
+    def _finish(self, result: AttributionResult) -> AttributionResult:
+        """Best-effort Layer 4 attestation; never breaks attribution."""
+        from .evidence import safe_append_evidence
+
+        safe_append_evidence(
+            "attribution",
+            result.failed_call_id,
+            asdict(result),
+            ledger=self.evidence,
+        )
+        return result
 
     def _load_session_calls(self, session_id: int) -> list[CallSnapshot]:
         """Load all calls for a session, ordered chronologically.
@@ -176,6 +252,12 @@ class AttributionEngine:
         prior calls in the same session, scores each as a candidate, and
         returns the highest-scoring one.
 
+        Abstains (confidence 0, no root cause) when:
+          - the failed call's error_message is infra / SDK / load-test
+            (reason ``infra/non-content``), or
+          - the winning candidate has no measurable drift or compression
+            (reason ``unattributable``) — recency alone is not enough.
+
         If `calls` is provided (pre-loaded session calls), it's reused instead
         of re-querying storage — used by `attribute_session()` to avoid an
         N+1 query pattern when attributing multiple failures in one session.
@@ -185,20 +267,26 @@ class AttributionEngine:
             calls = self._load_session_calls(session_id)
         index_by_id = {c.id: i for i, c in enumerate(calls)}
 
-    
-    
         if failed_call_id not in index_by_id:
-            return AttributionResult(
-                session_id=session_id,
-                failed_call_id=failed_call_id,
-                root_cause_call_id=None,
-                root_cause_step_offset=None,
-                confidence=0.0,
-                reason="failed_call_id not found in session",
-                signal_breakdown={},
+            return self._finish(
+                AttributionResult(
+                    session_id=session_id,
+                    failed_call_id=failed_call_id,
+                    root_cause_call_id=None,
+                    root_cause_step_offset=None,
+                    confidence=0.0,
+                    reason="failed_call_id not found in session",
+                    signal_breakdown={},
+                )
             )
 
         fail_idx = index_by_id[failed_call_id]
+        failed_call = calls[fail_idx]
+        if is_non_content_failure(failed_call.error_message):
+            return self._finish(
+                _abstain(session_id, failed_call_id, INFRA_NON_CONTENT_REASON)
+            )
+
         lookback_start = max(0, fail_idx - self.lookback)
 
         best_score = -1.0
@@ -232,16 +320,23 @@ class AttributionEngine:
                     "weighted_total": score,
                 }
 
+        if best_call is None or not _has_content_signal(best_breakdown):
+            return self._finish(
+                _abstain(session_id, failed_call_id, UNATTRIBUTABLE_REASON)
+            )
+
         reason = self._explain(best_call, best_offset, best_breakdown)
 
-        return AttributionResult(
-            session_id=session_id,
-            failed_call_id=failed_call_id,
-            root_cause_call_id=best_call.id if best_call else None,
-            root_cause_step_offset=best_offset,
-            confidence=round(min(1.0, max(0.0, best_score)), 4),
-            reason=reason,
-            signal_breakdown=best_breakdown,
+        return self._finish(
+            AttributionResult(
+                session_id=session_id,
+                failed_call_id=failed_call_id,
+                root_cause_call_id=best_call.id if best_call else None,
+                root_cause_step_offset=best_offset,
+                confidence=round(min(1.0, max(0.0, best_score)), 4),
+                reason=reason,
+                signal_breakdown=best_breakdown,
+            )
         )
 
     def attribute_session(self, session_id: int) -> list[AttributionResult]:

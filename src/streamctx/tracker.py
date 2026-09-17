@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import threading
 import weakref
 from collections import Counter
@@ -12,6 +13,155 @@ from typing import Any, Callable, Optional
 from . import pricing
 from .storage import get_storage
 from .healer import SelfHealingEngine
+
+
+OPENAI_CREATE_KEY = "openai.resources.chat.completions.Completions.create"
+ANTHROPIC_CREATE_KEY = "anthropic.resources.messages.Messages.create"
+
+# Process-wide SDK originals and a single class-level patch.
+# Per-tracker start() used to replace Completions.create and save whatever
+# was currently installed — often the previous tracker's wrapper. After a
+# start/stop cycle that wrapper called itself (RecursionError) or looked
+# up a cleared _originals key (KeyError with the key as the message).
+_sdk_lock = threading.Lock()
+_sdk_originals: dict[str, Any] = {}
+_sdk_started: list[Any] = []
+_client_owners: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+
+
+def _is_patched(fn: Any) -> bool:
+    if fn is None:
+        return False
+    if getattr(fn, "_streamctx_patched", False):
+        return True
+    inner = getattr(fn, "__func__", None)
+    return bool(inner and getattr(inner, "_streamctx_patched", False))
+
+
+def _register_owner(obj: Any, tracker: Any) -> None:
+    try:
+        _client_owners[obj] = tracker
+    except TypeError:
+        pass
+
+
+def _invoke_original(original: Any, bound_self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """Call a captured create() without injecting a second ``self``."""
+    if inspect.ismethod(original) and args and args[0] is bound_self:
+        args = args[1:]
+    return original(*args, **kwargs)
+
+
+def _resolve_openai_cls() -> Any:
+    try:
+        import openai.resources.chat.completions as chat_completions
+        return chat_completions.Completions
+    except ImportError:
+        return None
+
+
+def _resolve_anthropic_cls() -> Any:
+    try:
+        import anthropic.resources.messages as messages
+        return messages.Messages
+    except ImportError:
+        return None
+
+
+def _dispatch_tracker(sdk_obj: Any) -> Optional["LLMTracker"]:
+    try:
+        owner = _client_owners.get(sdk_obj)
+    except Exception:
+        owner = None
+    if owner is not None and owner.state.active:
+        return owner
+    with _sdk_lock:
+        started = list(_sdk_started)
+    for tracker in reversed(started):
+        if getattr(tracker.state, "active", False):
+            return tracker
+    default = _trackers.get(DEFAULT_AGENT_ID)
+    if default is not None and default.state.active:
+        return default
+    return None
+
+
+def _patched_openai_create(self_completions: Any, *args: Any, **kwargs: Any) -> Any:
+    original = _sdk_originals.get(OPENAI_CREATE_KEY)
+    if original is None:
+        cls = _resolve_openai_cls()
+        if cls is None:
+            raise RuntimeError("OpenAI Completions.create original is missing")
+        original = cls.create
+    def invoke() -> Any:
+        return original(self_completions, *args, **kwargs)
+    tracker = _dispatch_tracker(self_completions)
+    if tracker is None:
+        return invoke()
+    return tracker._intercept_call(invoke, "openai", kwargs)
+
+
+def _patched_anthropic_create(self_messages: Any, *args: Any, **kwargs: Any) -> Any:
+    original = _sdk_originals.get(ANTHROPIC_CREATE_KEY)
+    if original is None:
+        cls = _resolve_anthropic_cls()
+        if cls is None:
+            raise RuntimeError("Anthropic Messages.create original is missing")
+        original = cls.create
+    def invoke() -> Any:
+        return original(self_messages, *args, **kwargs)
+    tracker = _dispatch_tracker(self_messages)
+    if tracker is None:
+        return invoke()
+    return tracker._intercept_call(invoke, "anthropic", kwargs)
+
+
+_patched_openai_create._streamctx_patched = True
+_patched_anthropic_create._streamctx_patched = True
+
+
+def _install_openai_patch() -> None:
+    cls = _resolve_openai_cls()
+    if cls is None:
+        return
+    current = cls.create
+    if OPENAI_CREATE_KEY not in _sdk_originals and not _is_patched(current):
+        _sdk_originals[OPENAI_CREATE_KEY] = current
+    if not _is_patched(current):
+        cls.create = _patched_openai_create
+
+
+def _install_anthropic_patch() -> None:
+    cls = _resolve_anthropic_cls()
+    if cls is None:
+        return
+    current = cls.create
+    if ANTHROPIC_CREATE_KEY not in _sdk_originals and not _is_patched(current):
+        _sdk_originals[ANTHROPIC_CREATE_KEY] = current
+    if not _is_patched(current):
+        cls.create = _patched_anthropic_create
+
+
+def _restore_sdk_patches() -> None:
+    openai_cls = _resolve_openai_cls()
+    openai_orig = _sdk_originals.pop(OPENAI_CREATE_KEY, None)
+    if openai_cls is not None and openai_orig is not None and _is_patched(openai_cls.create):
+        openai_cls.create = openai_orig
+    anthropic_cls = _resolve_anthropic_cls()
+    anthropic_orig = _sdk_originals.pop(ANTHROPIC_CREATE_KEY, None)
+    if anthropic_cls is not None and anthropic_orig is not None and _is_patched(anthropic_cls.create):
+        anthropic_cls.create = anthropic_orig
+
+
+def _reset_sdk_patches() -> None:
+    """Test helper: drop start() refcounts and restore real SDK methods."""
+    with _sdk_lock:
+        _sdk_started.clear()
+        _restore_sdk_patches()
+    try:
+        _client_owners.clear()
+    except Exception:
+        pass
 
 
 def _hash_text(text: str) -> str:
@@ -149,20 +299,22 @@ class LLMTracker:
 
     def start(self) -> None:
         with self.state._lock:
-            if self.state.active:
-                return
-            self.state.active = True
-            self.state.session_id = self.state.storage.start_session()
-            self._patch_sdks()
+            if not self.state.active:
+                self.state.active = True
+                self.state.session_id = self.state.storage.start_session()
+        # Always (re)register for the process-wide class patch. wrap() may
+        # have already set active=True without installing Completions.create.
+        self._patch_sdks()
 
     def stop(self) -> None:
         with self.state._lock:
             if not self.state.active:
                 return
-            self._unpatch_sdks()
-            if self.state.session_id is not None:
-                self.state.storage.end_session(self.state.session_id)
+            session_id = self.state.session_id
             self.state.active = False
+        self._unpatch_sdks()
+        if session_id is not None:
+            self.state.storage.end_session(session_id)
 
     def _ensure_session(self) -> None:
         if not self.state.active:
@@ -198,9 +350,10 @@ class LLMTracker:
 
         if hasattr(client, "chat") and hasattr(client.chat, "completions"):
             completions = client.chat.completions
+            _register_owner(client, self)
+            _register_owner(completions, self)
             current = completions.create
-            if getattr(current, "_streamctx_patched", False):
-
+            if _is_patched(current):
                 with _wrapped_client_lock:
                     _wrapped_clients.add(client)
                 return client
@@ -209,7 +362,7 @@ class LLMTracker:
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
                 return tracker._intercept_call(
-                    lambda: original_create(*args, **kwargs),
+                    lambda: _invoke_original(original_create, completions, args, kwargs),
                     provider="openai",
                     kwargs=kwargs,
                 )
@@ -222,8 +375,10 @@ class LLMTracker:
 
         if hasattr(client, "messages") and hasattr(client.messages, "create"):
             messages = client.messages
+            _register_owner(client, self)
+            _register_owner(messages, self)
             current = messages.create
-            if getattr(current, "_streamctx_patched", False):
+            if _is_patched(current):
                 with _wrapped_client_lock:
                     _wrapped_clients.add(client)
                 return client
@@ -232,7 +387,7 @@ class LLMTracker:
 
             def patched_create(*args: Any, **kwargs: Any) -> Any:
                 return tracker._intercept_call(
-                    lambda: original_create(*args, **kwargs),
+                    lambda: _invoke_original(original_create, messages, args, kwargs),
                     provider="anthropic",
                     kwargs=kwargs,
                 )
@@ -261,74 +416,41 @@ class LLMTracker:
         return self.state.storage.get_session_stats(self.state.session_id)
 
     def _patch_sdks(self) -> None:
-        self._patch_openai()
-        self._patch_anthropic()
+        with _sdk_lock:
+            if self not in _sdk_started:
+                _sdk_started.append(self)
+            _install_openai_patch()
+            _install_anthropic_patch()
+            if OPENAI_CREATE_KEY in _sdk_originals:
+                self.state._originals[OPENAI_CREATE_KEY] = _sdk_originals[OPENAI_CREATE_KEY]
+            if ANTHROPIC_CREATE_KEY in _sdk_originals:
+                self.state._originals[ANTHROPIC_CREATE_KEY] = _sdk_originals[ANTHROPIC_CREATE_KEY]
 
     def _unpatch_sdks(self) -> None:
-        for key, original in list(self.state._originals.items()):
-            cls = self._resolve_patch_target(key)
-            if cls is not None:
-                setattr(cls, "create", original)
-        self.state._originals.clear()
-        self.state._wrapped_clients.clear()
+        with _sdk_lock:
+            try:
+                _sdk_started.remove(self)
+            except ValueError:
+                pass
+            self.state._originals.clear()
+            self.state._wrapped_clients.clear()
+            if not _sdk_started:
+                _restore_sdk_patches()
 
     def _resolve_patch_target(self, key: str) -> Any:
-        try:
-            if key.startswith("openai."):
-                import openai.resources.chat.completions.completions as mod
-                return mod.Completions
-            if key.startswith("anthropic."):
-                import anthropic.resources.messages.messages as mod
-                return mod.Messages
-        except ImportError:
-            return None
+        if key.startswith("openai."):
+            return _resolve_openai_cls()
+        if key.startswith("anthropic."):
+            return _resolve_anthropic_cls()
         return None
 
     def _patch_openai(self) -> None:
-        try:
-            import openai
-        except ImportError:
-            return
-        if hasattr(openai, "resources") and hasattr(openai.resources, "chat"):
-            completions_cls = openai.resources.chat.completions.Completions
-            key = "openai.resources.chat.completions.Completions.create"
-            if key not in self.state._originals:
-                self.state._originals[key] = completions_cls.create
-                tracker = self
-
-                def patched_create(self_completions: Any, *args: Any, **kwargs: Any) -> Any:
-                    original = tracker.state._originals[key]
-                    return tracker._intercept_call(
-                        lambda: original(self_completions, *args, **kwargs),
-                        provider="openai",
-                        kwargs=kwargs,
-                    )
-                patched_create._streamctx_patched = True
-
-                completions_cls.create = patched_create
+        with _sdk_lock:
+            _install_openai_patch()
 
     def _patch_anthropic(self) -> None:
-        try:
-            import anthropic
-        except ImportError:
-            return
-        if hasattr(anthropic, "resources") and hasattr(anthropic.resources, "messages"):
-            messages_cls = anthropic.resources.messages.Messages
-            key = "anthropic.resources.messages.Messages.create"
-            if key not in self.state._originals:
-                self.state._originals[key] = messages_cls.create
-                tracker = self
-
-                def patched_create(self_messages: Any, *args: Any, **kwargs: Any) -> Any:
-                    original = tracker.state._originals[key]
-                    return tracker._intercept_call(
-                        lambda: original(self_messages, *args, **kwargs),
-                        provider="anthropic",
-                        kwargs=kwargs,
-                    )
-                patched_create._streamctx_patched = True
-
-                messages_cls.create = patched_create
+        with _sdk_lock:
+            _install_anthropic_patch()
 
     def _intercept_call(
         self,
