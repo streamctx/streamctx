@@ -1,12 +1,12 @@
 ---
-knowledge_version: 2026-09-17.5
+knowledge_version: 2026-09-17.6
 last_updated: 2026-09-17
 pypi_version: 0.4.6
 source_repo: streamctx/streamctx
-source_commit: working-tree on cursor/layer3-repair-hardening (parent ee9cc9d / Layer 2)
+source_commit: working-tree on cursor/layer4-evidence-hardening (parent e432cb7 / Layer 3)
 canonical_branch: main
 reviewed: true
-review_note: Layer 1 and Layer 2 sections are the prior hardened trees. Layer 3 section regenerated from live repair.py / shadow.py / storage.py on cursor/layer3-repair-hardening. Layers 1–3 PRs are not merged to main as part of this pass. Canonical full-product copy for agents lives at streamctx-agents/knowledge/streamctx_project_knowledge.md.
+review_note: Layer 4 section regenerated from live evidence.py / scripts/verify_attestation.py on cursor/layer4-evidence-hardening. Layers 1–4 PRs are not merged to main as part of this pass. Canonical full-product copy for agents lives at streamctx-agents/knowledge/streamctx_project_knowledge.md.
 ---
 
 # StreamCtx Layer 1 — Core SDK (verified)
@@ -14,11 +14,12 @@ review_note: Layer 1 and Layer 2 sections are the prior hardened trees. Layer 3 
 Citation format: `path:start-end` relative to this SDK checkout.
 
 **Status:** SHIPPED in `src/streamctx/` of PyPI 0.4.6 / `main`. Hardened 2026-09-17
-(senior-bar + structural fixes). Layer 2 and Layer 3 are re-audited in this file
-(sections below). Layer 4 is shipped but **not** re-audited here.
+(senior-bar + structural fixes). Layers 2, 3, and 4 are re-audited in this file
+(sections below).
 
 Close-out: `knowledge/HARDENING.md` (Layer 1 — Core SDK hardening; Layer 2 —
-Attribution Engine hardening; Layer 3 — Verified Auto-Repair hardening).
+Attribution Engine hardening; Layer 3 — Verified Auto-Repair hardening; Layer 4 —
+Compliance Evidence hardening).
 
 ---
 
@@ -403,4 +404,138 @@ None in Layer 3. No `license_key`, `requires_pro`, `STREAMCTX_PAID`, or
 | Tracker intercept flagging a successful hallucination as `failed=True` with empty `error_message` | **Still assumed / dead in intercept** | Success path persists `failed=False`. Shadow only fires on explicit `record_call(failed=True, error_message=None)` (or equivalent). Organic path remains unproven against live tracker hallucinations. |
 | Semantic "the reply used the restored fact correctly" beyond substring match | **Still assumed / weak** | Independent gate is evidence + echo, not an NLI check. |
 | Supabase shadow_repair_log | **Not shipped** | SQLite-only. |
-| Layer 4 / `deploy/streamlit-cloud` / merge to `main` | **Not this pass** | Explicitly out of scope. |
+| Layer 4 / `deploy/streamlit-cloud` / merge to `main` | **Not this pass** | Explicitly out of scope. Layer 4 was subsequently hardened on `cursor/layer4-evidence-hardening` (section below). |
+
+---
+
+<!-- section: layer-4-compliance-evidence -->
+# Layer 4 — Compliance Evidence (SHIPPED, free forever)
+
+MIT-licensed. `evidence.py` / `scripts/verify_attestation.py` have no license
+check, paid flag, or hosted-only branch. Source: `src/streamctx/evidence.py:23-24`.
+Proven: `tests/test_layer4_hardening.py::test_no_paid_gate_in_evidence_source`.
+
+Separate SQLite file `evidence_ledger.db`, never `sessions.db`.
+Source: `src/streamctx/evidence.py:1-5,189-192`.
+
+Layer 2/3 write through `safe_append_evidence` and never fail the caller.
+Sources: `src/streamctx/attribution.py:353-363`, `src/streamctx/repair.py:292-301`,
+`src/streamctx/evidence.py:1201-1216`.
+
+## Signing coverage (schema 1.1 / hash_version 2)
+
+Every ledger row is Ed25519-signed. The signature is over
+`bytes.fromhex(entry_hash)`. v2 `entry_hash` is SHA-256 of canonical JSON of
+`SIGNED_ENTRY_KEYS`: `entry_id`, `record_type`, `record_ref_id`,
+`record_payload_hash`, `prev_hash` (global), `session_prev_hash`, `timestamp`,
+`hash_version`, `key_id`, `repair_disposition`, `applied`, `resolved`, `dry_run`.
+Sources: `src/streamctx/evidence.py:61-99,226-241,298-301,732-748`.
+Schema 1.0 concatenated hashes remain verifiable as `hash_version=1`.
+Source: `src/streamctx/evidence.py:210-223`.
+
+`prev_hash` **is** in the signed preimage. Reordering or dropping a committed
+row breaks the successor. A write that was never attempted is **not** visible
+to the hash chain; use `reconcile_shadow_log()` against `shadow_repair_log`
+for Layer 3 omissions. Attribution has no independent table.
+Source: `src/streamctx/evidence.py:1117-1152`.
+
+## Applied vs verified (was a FAIL; now first-class signed fields)
+
+Layer 3 `verify_fix()` is counterfactual: `applied` is always `False` unless a
+caller applies a candidate out of band. Source: `src/streamctx/repair.py:245-247,264`.
+
+Pre-fix schema 1.0 exported only hashes. An auditor reading `record_type=repair`
+could not see `applied=false`. The payload inside `evidence_payloads` did
+contain `applied`, but (1) it was not exported, and (2) `evidence_payloads` had
+no append-only trigger, so flipping `applied` to `true` left `verify_chain()`
+valid.
+
+Fix: `disposition_from_payload()` maps a repair payload onto signed columns and
+**never treats `resolved` as `applied`**. Shadow success is
+`repair_disposition=verified_not_applied`. Sources:
+`src/streamctx/evidence.py:17-21,69-80,336-359`.
+`export_attestation()` emits those fields plus a verifier-recomputed
+`repair_summary` and a `layer3_contract` note. Sources:
+`src/streamctx/evidence.py:1016-1115`.
+Payloads are append-only. Sources: `src/streamctx/evidence.py:103-106,163-173`.
+`verify_chain()` hashes `payload_json` against `record_payload_hash`.
+Source: `src/streamctx/evidence.py:904-915`.
+
+Proven: `test_shadow_verified_not_applied_is_unambiguous` (real
+`VerifiedRepairEngine.verify_fix(dry_run=False)` → bundle
+`repair_disposition=verified_not_applied`, `applied=false`,
+`repair_summary.applied_count=0`; offline script prints
+"no bundled repair was applied"). `test_payload_rewrite_is_detected`.
+
+## `verify_chain()` precision
+
+Walks the **full** global chain. `record_ref_id` only fills `matched_ref`; it
+does not skip predecessors. Source: `src/streamctx/evidence.py:846-853`.
+
+| Tamper | `broken_at_entry_id` | `reason` |
+| --- | --- | --- |
+| Modify `record_payload_hash` of entry 3 | 3 | `payload_hash_mismatch` or `hash_mismatch` |
+| Delete entry 3 | 3 | `entry_id_gap` (`found_entry_id=4`, `gap_after_entry_id=2`) |
+| Swap fields of entries 2 and 3 | 2 or 3 | hash / prev mismatch |
+| Splice foreign `entry_id=99` | 4 | `entry_id_gap` (`found_entry_id=99`) |
+
+Proven: `tests/test_layer4_hardening.py` tamper cases.
+
+Uncommitted kill-9: `*.intent` fsync-before-COMMIT. On open, a leftover intent
+for a missing `entry_id` → `valid=False`, `reason=uncommitted_intent`.
+Sources: `src/streamctx/evidence.py:583-591,600-627,750-756,857-863`.
+Committed pair is one SQLite transaction (`BEGIN IMMEDIATE`, WAL,
+`synchronous=FULL`). Sources: `src/streamctx/evidence.py:430-441,700-701`.
+
+## Session export vs global chain
+
+Pre-fix 1.0 offline verifier linked `prev_hash` to the previous **bundled**
+row. Interleaved sessions (A, B, A) made an honest session-A export FAIL.
+
+Fix: signed `session_prev_hash` plus 1.1 verifier session-chain check.
+Sources: `src/streamctx/evidence.py:715-729`,
+`scripts/verify_attestation.py:524-554,604`.
+Proven: `test_interleaved_session_export_verifies`.
+
+## Third-party verify
+
+`scripts/verify_attestation.py` imports stdlib + `cryptography` only (no
+`streamctx`). Proven: `tests/test_evidence.py::test_verify_script_has_zero_streamctx_imports`.
+
+Embedded `public_key_pem` is enough for **integrity**, not authenticity.
+Anyone can mint a keypair and a self-consistent bundle. `--public-key` pins
+the issuer; `--require-pin` refuses the unpinned path. Sources:
+`scripts/verify_attestation.py:250-327,744-756`.
+`signing_keys` is append-only; each row stores `key_id` so rotation keeps
+historic signatures verifiable. Sources: `src/streamctx/evidence.py:145-149,174-185,629-633`.
+Proven: `test_foreign_keypair_bundle_rejected_when_pinned`,
+`test_key_rotation_keeps_historic_entries_verifiable`.
+
+Auditor doc: `docs/COMPLIANCE_VERIFICATION.md`.
+
+## Concurrency
+
+Pre-fix: 50 separate `EvidenceLedger` objects on one DB → 38
+`UNIQUE constraint failed: evidence_ledger.entry_id`, 12 of 50 rows.
+Fix: `BEGIN IMMEDIATE` under the write lock, retry on busy/unique.
+Source: `src/streamctx/evidence.py:695-826`.
+Proven: `test_concurrent_append_50_separate_ledger_objects` (50 unique ids,
+chain valid, ledger rows == payload rows).
+
+## Proof vs still-assumed
+
+| Path | Proven? | How |
+| --- | --- | --- |
+| Four tamper classes, precise `broken_at_entry_id` | **Yes** | `test_tamper_*` |
+| Payload rewrite `applied=true` is detected | **Yes** | `test_payload_rewrite_is_detected` |
+| Interleaved session export verifies offline | **Yes** | `test_interleaved_session_export_verifies` |
+| Layer 3 shadow verify → `verified_not_applied` in the bundle | **Yes** | `test_shadow_verified_not_applied_is_unambiguous` |
+| Foreign keypair rejected when issuer key is pinned | **Yes** | `test_foreign_keypair_bundle_rejected_when_pinned` |
+| Key rotation, historic rows still verify | **Yes** | `test_key_rotation_keeps_historic_entries_verifiable` |
+| 50-worker concurrent append, separate ledger objects | **Yes** | `test_concurrent_append_50_separate_ledger_objects` |
+| Kill-9: `integrity_check=ok`, equal ledger/payload counts, intent or valid chain | **Yes** | `test_kill9_mid_write_fail_safe` |
+| Shadow log without evidence row is reconcilable | **Yes** | `test_silent_omission_is_detectable_against_shadow_log` |
+| Full suite after this pass | **Yes** | `python -m pytest tests/ --tb=line -q` → **221 passed, 1 skipped** |
+| Never-attempted Layer 2 attribution (no independent table) | **Still assumed / weak** | Hash chains cannot prove completeness of events never presented to the logger. `safe_append_evidence` swallows errors by contract. |
+| Power-loss (not process kill) with `synchronous=FULL` | **Still assumed** | SQLite FULL+WAL survives `kill -9`; a hard power cut can still lose the last COMMIT. Intent file is best-effort. |
+| `deploy/streamlit-cloud` / merge of Layers 1–4 into `main` | **Not this pass** | Explicitly out of scope. |

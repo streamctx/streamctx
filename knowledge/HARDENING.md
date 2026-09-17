@@ -265,3 +265,68 @@ The remaining holes were (1) verification that accepted an invented echo, (2) co
 | Layer 4 / `deploy/streamlit-cloud` / merge to `main` | **Not this pass** | Explicitly out of scope. |
 
 `classify_failure()` was not moved out of Layer 3. Layer 2 still imports it. That layering inversion remains debt; this pass refused to change the function's meaning to "fix" it.
+
+---
+
+# Layer 4 — Compliance Evidence hardening
+
+Date: 2026-09-17
+SDK parent: `e432cb7` on `cursor/layer3-repair-hardening` (not merged to `main` in this pass). Layer 4 fixes are on `cursor/layer4-evidence-hardening`.
+
+No part of Layer 4 is gated behind a paid tier. `evidence.py` / `scripts/verify_attestation.py` have no license check, paid flag, or hosted-only branch. Core evidence stays MIT.
+
+**The applied/verified distinction was not already correct in the exported attestation.** Layer 3 recorded `applied=False` in the in-process `RepairResult` and in `evidence_payloads.payload_json`, but schema 1.0 `export_attestation()` stripped payloads. An outside reader of the JSON bundle saw `record_type: "repair"` and could not tell verified-in-shadow from applied. `evidence_payloads` also had no append-only trigger, so rewriting `applied` to `true` left `verify_chain()` valid. That is the fix this pass exists for.
+
+Layer 3's counterfactual contract was not changed. `applied` is still always `False` from `verify_fix()` unless a caller applies a candidate out of band.
+
+## Senior-bar results against pre-fix code
+
+Judged against live `src/streamctx/evidence.py` / `scripts/verify_attestation.py` before the structural change. Probe: `scripts/layer4_senior_bar_pre.py`. Same bar as Layers 1–3 (do not round "weak" up to "works"):
+
+| Case | Pre-fix verdict | What actually happened |
+| --- | --- | --- |
+| Signing coverage | **PARTIAL** | Every row signed. `entry_hash` covered `entry_id+type+ref+payload_hash+prev_hash+timestamp` (concat, no delimiters). `applied` / `resolved` / `key_id` / `session_prev_hash` were not signed fields. |
+| Tamper field-modify | **PASS** | `broken_at_entry_id=3`, `total_checked=2`. |
+| Tamper delete | **PARTIAL** | Delete of 3 reported `broken_at_entry_id=4` (successor prev mismatch). No `entry_id` gap reason. |
+| Tamper reorder | **PASS** | `broken_at_entry_id=2`. |
+| Tamper foreign-splice | **PASS** | `broken_at_entry_id=99`. |
+| Payload rewrite `applied→true` | **FAIL** | `verify_chain()` stayed `valid=True`. No append-only trigger on `evidence_payloads`. |
+| Interleaved session export | **FAIL** | Honest session-A bundle (entries 1 and 3) failed `verify_attestation.py` on global `prev_hash` vs previous bundled row. |
+| Applied vs verified in the bundle | **FAIL** | Real `verify_fix(dry_run=False)`: `resolved=True`, `applied=False` in the payload. Export had no `applied` / `repair_disposition`. `record_type=repair` was the only signal. |
+| Unpinned embedded public key | **FAIL** | Attacker-generated keypair bundle: `verify_attestation.py` exit 0. No `--public-key`. |
+| Key rotation | **PARTIAL** | `verify_chain` broke at entry 1 after a new key. No per-entry `key_id`. Historic rows unverifiable. |
+| 50-worker concurrent append (separate ledger objects) | **FAIL** | 38 `UNIQUE constraint failed: evidence_ledger.entry_id`, 12 of 50 rows. Per-instance `threading.Lock` does not serialize cross-connection `SELECT max(id)+1`. Chain of the 12 looked valid. |
+| Silent omitted event | **WEAK** | Never-written entry: `verify_chain` valid. No reconcile helper. Inherent to hash chains for events never presented to the logger. |
+| kill-9 / torn write | **WEAK** | Two INSERTs, one COMMIT (atomic pair) but no `BEGIN IMMEDIATE`, no intent log. Uncommitted kill looks like a valid shorter chain. |
+| MIT / no paid gate | **PASS** | No license/paid needles. |
+
+The remaining holes were (1) exporting opaque hashes so applied/verified could not be read, (2) unsigned mutable payloads, (3) session exports that used the global chain, (4) unpinned authenticity, (5) no key_id so rotation broke history, (6) racy `entry_id` assignment across connections, (7) imprecise delete detection, (8) no detectable incomplete write.
+
+## Root-cause fixes (not one-test special cases)
+
+1. **Signed repair disposition.** Schema 1.1 / `hash_version` 2 hashes canonical JSON including `repair_disposition`, `applied`, `resolved`, `dry_run`, `session_prev_hash`, `key_id`. `disposition_from_payload()` maps Layer 3 payloads and never treats `resolved` as `applied`. Shadow success is `verified_not_applied`. `export_attestation()` emits those fields; the offline verifier recomputes `repair_summary` and FAILs a lying summary (`evidence.py:336-359,732-748,1087-1115`, `verify_attestation.py:224-243,639-661`).
+2. **Append-only payloads + payload-hash walk.** UPDATE/DELETE triggers on `evidence_payloads`. `verify_chain()` joins payloads, requires a row, and checks `payload_hash(payload_json) == record_payload_hash` (`evidence.py:103-106,163-173,904-915`).
+3. **Session chain + precise gaps.** Signed `session_prev_hash` so a single-session export verifies when other sessions interleaved. `verify_chain()` walks the full global chain (filter does not skip predecessors), reports `entry_id_gap` at the missing id, `found_entry_id` for a splice (`evidence.py:715-729,846-853,894-901`).
+4. **Atomic append + detectable incomplete write.** `BEGIN IMMEDIATE`, retries on busy/unique, `synchronous=FULL`, intent file fsync'd before COMMIT (`evidence.py:430-441,583-591,695-826`). Cross-connection 50-worker appends serialize on SQLite's write lock, not only a process `threading.Lock`.
+5. **Key pinning + rotation.** `signing_keys` is append-only. Each entry stores `key_id` (SHA-256 of the PEM). Verifier `--public-key` / `--require-pin`. Embedded key remains an integrity convenience and is labeled `AUTHENTICITY: UNPINNED` without a pin (`verify_attestation.py:250-327,744-756`).
+
+## Proof vs still-assumed
+
+| Path | Proven? | How |
+| --- | --- | --- |
+| Four tamper classes, precise `broken_at_entry_id` | **Yes** | `tests/test_layer4_hardening.py::test_tamper_*` |
+| Payload rewrite detected | **Yes** | `test_payload_rewrite_is_detected` |
+| Interleaved session export + pinned offline verify | **Yes** | `test_interleaved_session_export_verifies` |
+| Layer 3 shadow verify is `verified_not_applied` in the bundle | **Yes** | `test_shadow_verified_not_applied_is_unambiguous` |
+| Foreign keypair rejected when pinned | **Yes** | `test_foreign_keypair_bundle_rejected_when_pinned` |
+| Key rotation keeps historic rows verifiable | **Yes** | `test_key_rotation_keeps_historic_entries_verifiable` |
+| 50-worker concurrent append, separate ledger objects | **Yes** | `test_concurrent_append_50_separate_ledger_objects` |
+| Kill-9 fail-safe (integrity ok, ledger==payload, intent or valid) | **Yes** | `test_kill9_mid_write_fail_safe` |
+| Shadow log vs ledger reconcile | **Yes** | `test_silent_omission_is_detectable_against_shadow_log` |
+| Full suite | **Yes** | `python -m pytest tests/ --tb=line -q` → **221 passed, 1 skipped** |
+| Completeness of never-attempted Layer 2 attributions | **Still assumed / weak** | No independent attribution table. `safe_append_evidence` swallows errors so Layer 2/3 never break. |
+| Power-loss (not process kill) | **Still assumed** | Same SQLite limit as Layer 1. |
+| `deploy/streamlit-cloud` / merge of Layers 1–4 into `main` | **Not this pass** | Explicitly out of scope. |
+
+Schema 1.0 bundles remain verifiable. Prefer a 1.1 re-export: 1.0 session slices break under interleaving, and 1.0 cannot show `applied=false` without the raw payload.
+
