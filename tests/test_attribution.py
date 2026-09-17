@@ -7,6 +7,8 @@ heuristic.  Does not change attribute_failure()'s public interface.
 dominant_signal is derived the same way Layer 3 does: raw max of
 drift / compression / recency, ignoring weighted_total.  Ties follow
 dict insertion order (drift, then compression, then recency).
+``recency`` is topic-shift with the original task still buried, not the
+offset-0 ranking prior.
 """
 
 from __future__ import annotations
@@ -322,7 +324,7 @@ def _seed_drift_units(storage, session_id):
         reused_tokens=0,
         waste_category="ok",
     )
-    # token_drift=1.0 + waste flip → drift=1.0, ties recency=1.0, insertion wins
+    # Large message-shape jump + waste flip. Recency-why is 0 (one user turn).
     return storage.seed_call(
         session_id,
         _msgs(
@@ -361,30 +363,40 @@ def _seed_drift_api(storage, session_id):
     )
 
 
+def _buried_fact_messages(fact: str, question: str, fillers: int = 16) -> list[dict]:
+    """Over-budget conversation where Layer 1 compression drops `fact`."""
+    msgs = [
+        {"role": "system", "content": "Answer from the report only."},
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": "I will look at the report."},
+        {
+            "role": "user",
+            "content": (
+                "We discussed many operational topics. "
+                + ("chatter " * 80)
+                + f" Buried fact: {fact}"
+            ),
+        },
+        {"role": "assistant", "content": "Noted the operational discussion."},
+    ]
+    for i in range(fillers):
+        msgs.append(
+            {"role": "user", "content": f"Filler discussion {i} " + ("padding " * 40)}
+        )
+        msgs.append(
+            {"role": "assistant", "content": f"Filler reply {i} " + ("content " * 40)}
+        )
+    msgs.append({"role": "user", "content": question})
+    return msgs
+
+
 def _seed_compression_revenue(storage, session_id):
-    storage.seed_call(
-        session_id,
-        _msgs(("system", "Q3 2025 revenue was $12.4 million."), ("user", "Extract figures.")),
-        input_tokens=800,
-        reused_tokens=0,
-        waste_category=None,
-    )
-    storage.seed_call(
-        session_id,
-        _msgs(("system", "Earlier context: Q3 was strong."), ("user", "Continue.")),
-        input_tokens=800,
-        reused_tokens=640,
-        waste_category=None,
-    )
-    # reused==input, same tokens/waste as prev → compression=1.0 ties recency
+    question = "What was the exact Q3 revenue figure?"
+    msgs = _buried_fact_messages("Q3 revenue was $12.4 million.", question)
+    storage.seed_call(session_id, msgs[:2], reused_tokens=0, waste_category=None)
     return storage.seed_call(
         session_id,
-        _msgs(
-            ("system", "Compression dropped the exact revenue figure."),
-            ("user", "What was the exact Q3 2025 revenue?"),
-            ("assistant", "The Q3 2025 revenue was $47.3 million."),
-        ),
-        input_tokens=800,
+        msgs,
         reused_tokens=800,
         waste_category=None,
         failed=True,
@@ -393,21 +405,12 @@ def _seed_compression_revenue(storage, session_id):
 
 
 def _seed_compression_customer(storage, session_id):
-    storage.seed_call(
-        session_id,
-        _msgs(("system", "The only expansion account was Helios Retail."), ("user", "Name it.")),
-        input_tokens=600,
-        reused_tokens=0,
-        waste_category=None,
-    )
+    question = "What was the exact expansion account id?"
+    msgs = _buried_fact_messages("The only expansion account was HELIOS-01.", question)
+    storage.seed_call(session_id, msgs[:2], reused_tokens=0, waste_category=None)
     return storage.seed_call(
         session_id,
-        _msgs(
-            ("system", "Compression dropped the account name."),
-            ("user", "What was the exact name?"),
-            ("assistant", "Acme Corp."),
-        ),
-        input_tokens=600,
+        msgs,
         reused_tokens=600,
         waste_category=None,
         failed=True,
@@ -423,7 +426,7 @@ def _seed_recency_joke(storage, session_id):
         reused_tokens=0,
         waste_category=None,
     )
-    # small token bump, no reuse, same waste → recency=1.0 is the raw max
+    # Original task still in the failing call; last user turn abandons it.
     return storage.seed_call(
         session_id,
         _msgs(
@@ -508,9 +511,9 @@ def test_diverse_seeded_picks_specific_dominant_signal(
 def test_diverse_cases_are_robust_to_weight_swap(storage, monkeypatch):
     """The six clear cases should keep the same dominant_signal at 0.3/0.5/0.2.
 
-    They are constructed so one raw signal is a clear max (or a 1.0 tie
-    that insertion-order already awards).  Weights only pick the
-    candidate call; they do not relabel the raw-max signal.
+    They are constructed so one why-signal is a clear max. Weights pick
+    the candidate call; Layer 3 still labels by raw-max of the why-signals
+    (drift / compression / recency-as-topic-shift).
     """
     default_engine = AttributionEngine(storage=storage)
     default = {}
@@ -557,30 +560,46 @@ def test_diverse_cases_are_robust_to_weight_swap(storage, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _seed_neartie_drift_vs_compression(storage, session_id):
-    """Earlier call is full-drift; failing call is full-compression.
+    """Earlier call is a huge shape jump; failing call is real compression loss.
 
-    Default 0.5/0.3/0.2: earlier call wins (0.667 vs 0.50) → drift.
-    Swapped 0.3/0.5/0.2: failing call wins (0.70 vs 0.467) → compression.
+    Default 0.5/0.3/0.2: earlier call wins on drift.
+    Swapped 0.3/0.5/0.2: failing call wins on compression.
     """
     storage.seed_call(
         session_id,
         _msgs(("user", "baseline")),
-        input_tokens=100,
-        reused_tokens=0,
         waste_category="ok",
     )
+    padding = _buried_fact_messages(
+        "no numeric identifier here, just chatter.",
+        "Continue the operational review.",
+    )
+    # Strip digits from padding so compression-loss stays 0 on this step.
+    for msg in padding:
+        msg["content"] = (
+            str(msg.get("content") or "")
+            .replace("0", "o")
+            .replace("1", "i")
+            .replace("2", "z")
+            .replace("3", "e")
+            .replace("4", "a")
+            .replace("5", "s")
+            .replace("6", "g")
+            .replace("7", "t")
+            .replace("8", "b")
+            .replace("9", "n")
+        )
     earlier = storage.seed_call(
         session_id,
-        _msgs(("user", "shape changed hard")),
-        input_tokens=200,
-        reused_tokens=0,
+        padding,
         waste_category="drift",
     )
     failed = storage.seed_call(
         session_id,
-        _msgs(("user", "same shape, fully reused")),
-        input_tokens=200,
-        reused_tokens=200,
+        _buried_fact_messages(
+            "Q3 revenue was $12.4 million.",
+            "What was the exact Q3 revenue figure?",
+        ),
         waste_category="drift",
         failed=True,
         error_message="context overflow",
@@ -589,35 +608,26 @@ def _seed_neartie_drift_vs_compression(storage, session_id):
 
 
 def _seed_neartie_drift_vs_recency(storage, session_id):
-    """Earlier call is full-drift; failing call is high-reuse but not 1.0.
-
-    Default: earlier 0.667 > fail 0.47 → drift.
-    Swapped: fail 0.65 > earlier 0.467 → recency (raw recency 1.0 > 0.90).
+    """Topic-shift recency on the failing call. Recency weight is 0.2 in
+    both the default and the 0.3/0.5/0.2 swap, so this must not flip.
     """
     storage.seed_call(
         session_id,
-        _msgs(("user", "baseline")),
-        input_tokens=100,
-        reused_tokens=0,
-        waste_category="ok",
-    )
-    earlier = storage.seed_call(
-        session_id,
-        _msgs(("user", "shape changed hard")),
-        input_tokens=200,
-        reused_tokens=0,
-        waste_category="drift",
+        _msgs(("user", "List the three launch risks: supply delay, FX, hiring lag.")),
+        waste_category=None,
     )
     failed = storage.seed_call(
         session_id,
-        _msgs(("user", "mostly reused")),
-        input_tokens=200,
-        reused_tokens=180,
-        waste_category="drift",
+        _msgs(
+            ("user", "List the three launch risks: supply delay, FX, hiring lag."),
+            ("assistant", "supply delay, FX, hiring lag"),
+            ("user", "Tell a pirate joke first and skip the risks this turn."),
+        ),
+        waste_category=None,
         failed=True,
         error_message="context overflow",
     )
-    return earlier, failed
+    return None, failed
 
 
 def _seed_neartie_robust_drift(storage, session_id):
@@ -625,15 +635,11 @@ def _seed_neartie_robust_drift(storage, session_id):
     storage.seed_call(
         session_id,
         _msgs(("user", "small")),
-        input_tokens=50,
-        reused_tokens=0,
         waste_category="ok",
     )
     failed = storage.seed_call(
         session_id,
-        _msgs(("user", "huge jump")),
-        input_tokens=500,
-        reused_tokens=0,
+        _msgs(("user", "STANDARD TERMS " * 80 + " huge jump")),
         waste_category="drift",
         failed=True,
         error_message="context overflow",
@@ -652,9 +658,9 @@ _NEARTIE_CASES = [
     (
         "nt-drift-vs-recency",
         _seed_neartie_drift_vs_recency,
-        "drift",
         "recency",
-        True,
+        "recency",
+        False,
     ),
     (
         "nt-robust-drift",
@@ -726,16 +732,12 @@ def test_near_tie_weight_sensitivity(
     assert flipped is weight_sensitive
 
 
-def test_dominant_signal_is_raw_max_not_weighted_contribution(storage, engine):
-    """Documented finding: weights do not relabel the signal on one candidate.
+def test_why_signal_is_topic_shift_not_offset_recency(storage, engine):
+    """Layer 3 reads raw-max of drift/compression/recency.
 
-    On the failing call, recency is always 1.0.  A compression of 0.90
-    loses the raw-max label to recency even though 0.5/0.3/0.2 would
-    rank the *contributions* as recency 0.20 vs compression 0.27 — wait,
-    default contributions here are recency 0.20 vs compression 0.27, so
-    weighted-contribution would pick compression, raw-max picks recency.
-
-    This test locks that current rule so a later fix is an explicit change.
+    ``recency`` is topic-shift, not the offset-0 prior of 1.0. An
+    under-budget reused_tokens row with identical prompts must abstain
+    rather than report recency=1.0 with confidence 0.47.
     """
     session_id = 901
     storage.seed_call(
@@ -755,22 +757,9 @@ def test_dominant_signal_is_raw_max_not_weighted_contribution(storage, engine):
         error_message="context overflow",
     )
     result = engine.attribute_failure(session_id, failed_id)
-    breakdown = result.signal_breakdown
-    raw = _dominant_signal(result)
-    contrib = _weighted_contributions(breakdown, (0.5, 0.3, 0.2))
-    contrib_winner = max(contrib, key=contrib.get)
-
-    print(
-        f"\nRAW-vs-WEIGHTED: raw_dominant={raw} "
-        f"weighted_contrib_winner={contrib_winner} "
-        f"raw={ {k: breakdown[k] for k in ('drift', 'compression', 'recency')} } "
-        f"contrib={contrib}"
-    )
-    assert breakdown["compression"] == pytest.approx(0.9)
-    assert breakdown["recency"] == pytest.approx(1.0)
-    assert raw == "recency"
-    assert contrib_winner == "compression"
-    assert raw != contrib_winner
+    assert result.reason == UNATTRIBUTABLE_REASON
+    assert result.signal_breakdown == {}
+    assert _dominant_signal(result) is None
 
 
 # ---------------------------------------------------------------------------

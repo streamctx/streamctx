@@ -9,17 +9,23 @@ for every failed call in a session, we walk backwards through the calls
 that preceded it and score each one as a candidate root cause using three
 signals:
 
-    DRIFT_WEIGHT       - how much the message/context shape changed
-                         between consecutive calls (proxy for "something
-                         shifted here")
-    COMPRESSION_WEIGHT - how much context was reused/compressed right
-                         before the failure (proxy for "information loss")
-    RECENCY_WEIGHT     - how close the candidate call is to the failure
-                         (closer = more likely the proximate cause)
+    DRIFT_WEIGHT       - message/context *shape* change between consecutive
+                         calls (token estimate from stored messages, not
+                         persist-zeroed usage columns)
+    COMPRESSION_WEIGHT - information loss from replaying Layer 1
+                         ``compress_messages()`` on the stored (uncompressed)
+                         request; 0 when compression would not have fired
+    RECENCY_WEIGHT     - (ranking) how close the candidate is to the failure.
+                         The *why*-signal stored as ``recency`` is topic
+                         shift with the original task still buried in context,
+                         not the offset-0 structural prior of 1.0.
 
 The weights are intentionally simple and tunable - this is the v1
 heuristic baseline described in the StreamCtx design doc. It is meant to
 be replaced/augmented later, not to be the final word in accuracy.
+
+Layer 2 is MIT-licensed core detection logic. Nothing in this module is
+gated on a paid tier, license check, or hosted-only flag.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
+from .compressor import _message_text, _total_tokens, compress_messages
 from .storage import get_storage
 
 # --- Tunable weights for the v1 heuristic (see design doc) ---
@@ -40,13 +47,30 @@ RECENCY_WEIGHT = 0.2
 # happened too long ago to plausibly be related.
 DEFAULT_LOOKBACK = 5
 
-# Recency at offset 0 is a structural prior (always 1.0), not evidence.
-# If the winning candidate has no measurable drift or compression, abstain
-# rather than report the recency floor as a root cause.
-CONTENT_SIGNAL_EPS = 1e-6
+# Token estimator is ``len(text) // 4``. Relative change on a 10-token
+# prompt is mostly noise (one short sentence). Floor the denominator at
+# 50 tokens (~200 characters) so a 6-token jitter cannot look like 60%
+# drift. A 21% move against that floor is 0.7 * 0.21 ≈ 0.15 — the
+# abstention gate. Sub-20% shape jitter is tokenizer/usage disagreement,
+# not a cause. Waste-category flips (0.3) clear the floor on their own
+# when *both* sides are labeled. Compression must show ~15% combined
+# savings+loss; a constraint-preserving compress that drops nothing
+# important stays unattributable.
+SHAPE_TOKEN_FLOOR = 50
+CONTENT_SIGNAL_FLOOR = 0.15
+# Back-compat alias; the gate is CONTENT_SIGNAL_FLOOR, not this epsilon.
+CONTENT_SIGNAL_EPS = CONTENT_SIGNAL_FLOOR
 
 UNATTRIBUTABLE_REASON = "unattributable"
 INFRA_NON_CONTENT_REASON = "infra/non-content"
+
+# Significant terms for recency Jaccard: 3+ letter words, numbers, IDs.
+_TERM_RE = re.compile(
+    r"[A-Za-z]{3,}|\d+(?:\.\d+)?|[A-Z]{2,}[-_][A-Z0-9]{2,}"
+)
+# Compression "information loss" is factual, not chatter. Filler words
+# dropped by extractive summary are not a cause; dropped numbers/IDs are.
+_FACT_RE = re.compile(r"\d+(?:\.\d+)?|[A-Z]{2,}[-_][A-Z0-9]{2,}")
 
 # Extra non-content needles beyond Layer 3 classify_failure() (401/429/
 # invalid model/timeout/…).  Kept here so repair.classify_failure() can
@@ -58,6 +82,15 @@ _NON_CONTENT_EXTRA_RE = re.compile(
     r"takes 1 argument|"
     r"Completions\.create|"
     r"missing 1 required positional argument",
+    re.IGNORECASE,
+)
+
+# Content failures whose error_message already names a cause outside
+# {drift, compression, recency}. Forcing a heuristic would send Layer 3
+# after the wrong repair. Abstain as unattributable, not infra.
+_OUT_OF_TAXONOMY_RE = re.compile(
+    r"prompt injection|\bjailbreak\b|"
+    r"poisoned?\s+(?:context|prompt|input|message)",
     re.IGNORECASE,
 )
 
@@ -101,38 +134,133 @@ def _safe_div(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
+def _shape_tokens(call: CallSnapshot) -> int:
+    """Token count for drift. Prefer stored messages over usage columns.
+
+    Layer 1 ``_persist_failure`` writes ``input_tokens=0`` /
+    ``reused_tokens=0`` (tracker.py). Treating that as a 100% token drop
+    is a measurement artifact, not drift. The uncompressed request is
+    still in ``messages_json``.
+    """
+    if call.messages:
+        try:
+            n = _total_tokens(call.messages)
+        except Exception:
+            n = 0
+        if n > 0:
+            return n
+    return max(0, int(call.input_tokens or 0))
+
+
 def _drift_score(prev: CallSnapshot, curr: CallSnapshot) -> float:
     """Estimate how much context 'drifted' between two consecutive calls.
 
-    Proxy signal: relative change in input token count, plus whether the
-    waste_category changed (a change in waste pattern often co-occurs with
-    a shift in what's actually in the context window).
+    Relative token-shape change against SHAPE_TOKEN_FLOOR, plus a waste
+    flip only when *both* sides have a non-null waste_category. A failed
+    row with waste=None is missing data, not a pattern change.
     """
-    if prev.input_tokens == 0:
-        token_drift = 1.0 if curr.input_tokens > 0 else 0.0
-    else:
-        token_drift = abs(curr.input_tokens - prev.input_tokens) / prev.input_tokens
-        token_drift = min(token_drift, 1.0)
+    prev_n = _shape_tokens(prev)
+    curr_n = _shape_tokens(curr)
+    denom = max(prev_n, curr_n, SHAPE_TOKEN_FLOOR)
+    token_drift = min(1.0, abs(curr_n - prev_n) / denom)
 
-    waste_changed = 1.0 if prev.waste_category != curr.waste_category else 0.0
+    if prev.waste_category and curr.waste_category:
+        waste_changed = 1.0 if prev.waste_category != curr.waste_category else 0.0
+    else:
+        waste_changed = 0.0
 
     return min(1.0, 0.7 * token_drift + 0.3 * waste_changed)
 
 
-def _compression_score(call: CallSnapshot) -> float:
-    """Estimate how much of this call's context was reused/compressed.
+def _significant_terms(text: str) -> set[str]:
+    return {m.group(0).lower() for m in _TERM_RE.finditer(text or "")}
 
-    High reuse right before a failure is a proxy for "stale or truncated
-    context fed into the model" - a classic failure precursor.
-    """
-    total = call.input_tokens
-    if total == 0:
+
+def _messages_blob(messages: list[dict[str, Any]]) -> str:
+    return " ".join(_message_text(m) for m in messages)
+
+
+def _fact_terms(text: str) -> set[str]:
+    return {m.group(0).lower() for m in _FACT_RE.finditer(text or "")}
+
+
+def _content_loss(original: list[dict[str, Any]], compressed: list[dict[str, Any]]) -> float:
+    orig = _fact_terms(_messages_blob(original))
+    if not orig:
         return 0.0
-    return min(1.0, _safe_div(call.reused_tokens, total))
+    kept = _fact_terms(_messages_blob(compressed))
+    return len(orig - kept) / len(orig)
+
+
+def _compression_score(call: CallSnapshot) -> float:
+    """Replay Layer 1 compression on the stored uncompressed request.
+
+    ``reused_tokens`` is *not* a compression signal: tracker sums
+    ContextDiffer prefix-reuse with compression savings, and failed
+    rows zero it. If ``compress_messages()`` would not fire (under
+    default ``max_tokens=2000``) or saves nothing, score is 0.
+    """
+    msgs = call.messages
+    if not msgs:
+        # No messages to replay. Do not treat reused_tokens as compression
+        # unless the usage column itself says we were over budget.
+        total = int(call.input_tokens or 0)
+        if total <= 2000:
+            return 0.0
+        savings = min(1.0, _safe_div(call.reused_tokens, total))
+        return savings
+
+    compressed, orig, comp = compress_messages(msgs)
+    if orig <= 0 or orig == comp:
+        return 0.0
+    loss = _content_loss(msgs, compressed)
+    if loss <= 0.0:
+        return 0.0
+    savings = min(1.0, (orig - comp) / orig)
+    return min(1.0, 0.5 * savings + 0.5 * loss)
+
+
+def _user_texts(messages: list[dict[str, Any]]) -> list[str]:
+    texts: list[str] = []
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        text = _message_text(msg).strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _recency_why_score(call: CallSnapshot) -> float:
+    """Topic shift with the original task still present in this call.
+
+    Offset-0 recency is a ranking prior, not a why. Recency-as-cause is
+    "the assigned task is still in context but the latest user turn
+    abandoned it". A single-turn prompt change is drift or nothing, not
+    recency. If the original terms are gone from the blob, the task was
+    replaced (drift), not buried.
+    """
+    users = _user_texts(call.messages)
+    if len(users) < 2:
+        return 0.0
+    orig = _significant_terms(users[0])
+    last = _significant_terms(users[-1])
+    if not orig or not last:
+        return 0.0
+    blob = _significant_terms(_messages_blob(call.messages))
+    buried = orig & blob
+    if len(buried) / len(orig) < 0.3:
+        return 0.0
+    union = orig | last
+    overlap = len(orig & last) / len(union) if union else 1.0
+    return min(1.0, max(0.0, 1.0 - overlap))
 
 
 def _recency_score(offset: int, lookback: int) -> float:
-    """Closer candidates (smaller offset) score higher. Linear decay."""
+    """Closer candidates (smaller offset) score higher. Linear decay.
+
+    Ranking prior only — not written into signal_breakdown['recency'].
+    """
     if lookback <= 0:
         return 0.0
     return max(0.0, 1.0 - (offset / (lookback + 1)))
@@ -157,7 +285,8 @@ def is_non_content_failure(error_message: Optional[str]) -> bool:
 def _has_content_signal(breakdown: dict[str, float]) -> bool:
     drift = float(breakdown.get("drift") or 0.0)
     compression = float(breakdown.get("compression") or 0.0)
-    return max(drift, compression) > CONTENT_SIGNAL_EPS
+    recency_why = float(breakdown.get("recency") or 0.0)
+    return max(drift, compression, recency_why) >= CONTENT_SIGNAL_FLOOR
 
 
 def _abstain(
@@ -181,6 +310,8 @@ def _row_to_snapshot(row: dict[str, Any]) -> CallSnapshot:
     try:
         messages = json.loads(raw_messages) if raw_messages else []
     except (TypeError, ValueError):
+        messages = []
+    if not isinstance(messages, list):
         messages = []
 
     return CallSnapshot(
@@ -254,9 +385,16 @@ class AttributionEngine:
 
         Abstains (confidence 0, no root cause) when:
           - the failed call's error_message is infra / SDK / load-test
-            (reason ``infra/non-content``), or
-          - the winning candidate has no measurable drift or compression
-            (reason ``unattributable``) — recency alone is not enough.
+            (reason ``infra/non-content``) — this gate runs *before*
+            content heuristics, so a timeout after a drifted prompt is
+            still infra, not DRIFT; or
+          - the error_message names a cause outside the three-bucket
+            taxonomy (prompt injection, jailbreak, poison) — abstain as
+            ``unattributable`` rather than force DRIFT/COMPRESSION/RECENCY; or
+          - the winning candidate's why-signals (drift / compression /
+            recency-as-topic-shift) are all below CONTENT_SIGNAL_FLOOR
+            (reason ``unattributable``). Offset recency is a ranking
+            prior and is not evidence.
 
         If `calls` is provided (pre-loaded session calls), it's reused instead
         of re-querying storage — used by `attribute_session()` to avoid an
@@ -286,6 +424,10 @@ class AttributionEngine:
             return self._finish(
                 _abstain(session_id, failed_call_id, INFRA_NON_CONTENT_REASON)
             )
+        if _OUT_OF_TAXONOMY_RE.search(str(failed_call.error_message or "")):
+            return self._finish(
+                _abstain(session_id, failed_call_id, UNATTRIBUTABLE_REASON)
+            )
 
         lookback_start = max(0, fail_idx - self.lookback)
 
@@ -301,12 +443,13 @@ class AttributionEngine:
             prev = calls[candidate_idx - 1] if candidate_idx > 0 else candidate
             drift = _drift_score(prev, candidate)
             compression = _compression_score(candidate)
-            recency = _recency_score(offset, self.lookback)
+            recency_why = _recency_why_score(candidate)
+            offset_recency = _recency_score(offset, self.lookback)
 
             score = (
                 DRIFT_WEIGHT * drift
                 + COMPRESSION_WEIGHT * compression
-                + RECENCY_WEIGHT * recency
+                + RECENCY_WEIGHT * offset_recency
             )
 
             if score > best_score:
@@ -316,7 +459,7 @@ class AttributionEngine:
                 best_breakdown = {
                     "drift": drift,
                     "compression": compression,
-                    "recency": recency,
+                    "recency": recency_why,
                     "weighted_total": score,
                 }
 
@@ -326,6 +469,11 @@ class AttributionEngine:
             )
 
         reason = self._explain(best_call, best_offset, best_breakdown)
+        content_confidence = (
+            DRIFT_WEIGHT * float(best_breakdown.get("drift") or 0.0)
+            + COMPRESSION_WEIGHT * float(best_breakdown.get("compression") or 0.0)
+            + RECENCY_WEIGHT * float(best_breakdown.get("recency") or 0.0)
+        )
 
         return self._finish(
             AttributionResult(
@@ -333,7 +481,7 @@ class AttributionEngine:
                 failed_call_id=failed_call_id,
                 root_cause_call_id=best_call.id if best_call else None,
                 root_cause_step_offset=best_offset,
-                confidence=round(min(1.0, max(0.0, best_score)), 4),
+                confidence=round(min(1.0, max(0.0, content_confidence)), 4),
                 reason=reason,
                 signal_breakdown=best_breakdown,
             )

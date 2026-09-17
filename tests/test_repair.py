@@ -142,58 +142,86 @@ def _msgs(*pairs):
     return [{"role": r, "content": c} for r, c in pairs]
 
 
-def _seed_session(storage, *, signal="recency", error_message="context overflow"):
-    """Seed a 2-call session whose dominant signal we can steer.
+def _buried_fact_messages(fact: str, question: str, fillers: int = 16) -> list[dict]:
+    msgs = [
+        {"role": "system", "content": "Answer from the report only."},
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": "I will look at the report."},
+        {
+            "role": "user",
+            "content": (
+                "We discussed many operational topics. "
+                + ("chatter " * 80)
+                + f" Buried fact: {fact}"
+            ),
+        },
+        {"role": "assistant", "content": "Noted the operational discussion."},
+    ]
+    for i in range(fillers):
+        msgs.append(
+            {"role": "user", "content": f"Filler discussion {i} " + ("padding " * 40)}
+        )
+        msgs.append(
+            {"role": "assistant", "content": f"Filler reply {i} " + ("content " * 40)}
+        )
+    msgs.append({"role": "user", "content": question})
+    return msgs
 
-    Attribution scores the failing call itself at offset 0 (recency=1.0).
-    Ties go to the first max key in insertion order (drift, compression,
-    recency), so:
-      - high reuse + stable tokens  → compression
-      - big token jump + waste flip → drift
-      - otherwise                   → recency
+
+def _seed_session(storage, *, signal="recency", error_message="context overflow"):
+    """Seed a 2-call session whose dominant why-signal we can steer.
+
+    Compression = Layer 1 compress_messages() actually drops a buried fact.
+    Drift = token-shape jump with the original task replaced (not buried).
+    Recency = original task still in context, last user turn abandons it.
     """
     session_id = 8
     first = _msgs(("user", "original task: summarize the report"))
-    second = _msgs(
-        ("user", "original task: summarize the report"),
-        ("assistant", "ok"),
-        ("user", "continue"),
-    )
 
     if signal == "compression":
+        second = _buried_fact_messages(
+            "Q3 revenue was $12.4 million.",
+            "What was the exact Q3 revenue figure?",
+        )
         storage.seed_call(
-            session_id, first, input_tokens=200, reused_tokens=0, waste_category=None
+            session_id, first, reused_tokens=0, waste_category=None
         )
         failed_id = storage.seed_call(
             session_id,
             second,
-            input_tokens=200,
-            reused_tokens=200,
+            reused_tokens=0,
             waste_category=None,
             failed=True,
             error_message=error_message,
         )
     elif signal == "drift":
+        second = _msgs(
+            ("system", "STANDARD TERMS " * 80),
+            ("user", "Ignore the previous assignment. Rewrite as a pirate shanty."),
+        )
         storage.seed_call(
-            session_id, first, input_tokens=50, reused_tokens=0, waste_category="ok"
+            session_id, first, reused_tokens=0, waste_category="ok"
         )
         failed_id = storage.seed_call(
             session_id,
             second,
-            input_tokens=500,
             reused_tokens=0,
             waste_category="drift",
             failed=True,
             error_message=error_message,
         )
     else:
+        second = _msgs(
+            ("user", "original task: summarize the report"),
+            ("assistant", "ok"),
+            ("user", "continue"),
+        )
         storage.seed_call(
-            session_id, first, input_tokens=100, reused_tokens=0, waste_category=None
+            session_id, first, reused_tokens=0, waste_category=None
         )
         failed_id = storage.seed_call(
             session_id,
             second,
-            input_tokens=110,
             reused_tokens=0,
             waste_category=None,
             failed=True,
