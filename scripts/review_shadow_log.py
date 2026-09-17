@@ -45,6 +45,26 @@ def load_shadow_log(db_path: Path, limit: int | None = None) -> list[dict[str, A
             FROM shadow_repair_log
             ORDER BY id ASC
         """
+        available = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(shadow_repair_log)").fetchall()
+        }
+        extra = [
+            col
+            for col in (
+                "resolved",
+                "dry_run",
+                "applied",
+                "needs_human_review",
+                "attempt_count",
+            )
+            if col in available
+        ]
+        if extra:
+            sql = sql.replace(
+                "fix_candidate, timestamp",
+                "fix_candidate, timestamp, " + ", ".join(extra),
+            )
         if limit is not None:
             rows = conn.execute(sql + " LIMIT ?", (int(limit),)).fetchall()
         else:

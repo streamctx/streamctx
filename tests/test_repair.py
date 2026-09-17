@@ -342,6 +342,7 @@ def test_verify_fix_compression_generates_dedupe_note(storage, engine):
     assert isinstance(result.fix_candidate, dict)
     assert result.fix_candidate["role"] == "system"
     assert "DEDUPE" in result.fix_candidate["content"]
+    assert "12.4" in result.fix_candidate["content"]
     assert result.proof["fix_strategy"] == "dedupe"
 
 
@@ -386,25 +387,29 @@ def test_verify_fix_resolved_requires_correct_value_present(storage, engine):
         failed_id,
         llm_fn=lambda _msgs: _FakeResponse("here is a clean summary"),
         dry_run=False,
-        correct_value="Lyon",
+        correct_value="summarize the report",
     )
     assert missing.resolved is False
-    assert missing.correct_value == "Lyon"
+    assert missing.correct_value == "summarize the report"
+    assert missing.applied is False
 
     restored = engine.verify_fix(
         session_id,
         failed_id,
-        llm_fn=lambda _msgs: _FakeResponse("Operating city is Lyon."),
+        llm_fn=lambda _msgs: _FakeResponse(
+            "I will now summarize the report with the original assignment."
+        ),
         dry_run=False,
-        correct_value="Lyon",
+        correct_value="summarize the report",
     )
     assert restored.dry_run is False
     assert restored.resolved is True
+    assert restored.applied is False
     assert restored.confidence_delta == round(
         1.0 - restored.proof["attribution_confidence"], 4
     )
     assert restored.proof["resolved"] is True
-    assert restored.proof["correct_value"] == "Lyon"
+    assert restored.proof["correct_value"] == "summarize the report"
 
 
 def test_verify_fix_correct_value_matches_unicode_space(storage, engine):
@@ -445,7 +450,7 @@ def test_verify_fix_live_unresolved_when_failure_persists(storage, engine):
         failed_id,
         llm_fn=lambda _msgs: _FakeResponse("still seeing context overflow here"),
         dry_run=False,
-        correct_value="Lyon",
+        correct_value="summarize the report",
     )
 
     assert result.resolved is False

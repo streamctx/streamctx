@@ -132,7 +132,12 @@ class SessionStorage:
                     attribution_reason TEXT,
                     dominant_signal TEXT,
                     fix_candidate TEXT,
-                    timestamp TEXT NOT NULL
+                    timestamp TEXT NOT NULL,
+                    resolved INTEGER DEFAULT 0,
+                    dry_run INTEGER DEFAULT 1,
+                    applied INTEGER DEFAULT 0,
+                    needs_human_review INTEGER DEFAULT 0,
+                    attempt_count INTEGER DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS idx_shadow_repair_session_id
                     ON shadow_repair_log(session_id);
@@ -175,7 +180,17 @@ class SessionStorage:
             "CREATE INDEX IF NOT EXISTS idx_calls_fingerprint "
             "ON calls(session_id, message_fingerprint)"
         )
+        self._migrate_shadow_repair_columns()
         self._write_conn.commit()
+
+    def _migrate_shadow_repair_columns(self) -> None:
+        self._ensure_column("shadow_repair_log", "resolved", "INTEGER DEFAULT 0")
+        self._ensure_column("shadow_repair_log", "dry_run", "INTEGER DEFAULT 1")
+        self._ensure_column("shadow_repair_log", "applied", "INTEGER DEFAULT 0")
+        self._ensure_column(
+            "shadow_repair_log", "needs_human_review", "INTEGER DEFAULT 0"
+        )
+        self._ensure_column("shadow_repair_log", "attempt_count", "INTEGER DEFAULT 1")
 
     def start_session(self) -> int:
         now = datetime.now(timezone.utc).isoformat()
@@ -496,6 +511,11 @@ class SessionStorage:
         dominant_signal: Optional[str],
         fix_candidate: Any,
         timestamp: Optional[str] = None,
+        resolved: bool = False,
+        dry_run: bool = True,
+        applied: bool = False,
+        needs_human_review: bool = False,
+        attempt_count: int = 1,
     ) -> None:
         from .shadow import serialize_fix_candidate
 
@@ -505,8 +525,10 @@ class SessionStorage:
                 """
                 INSERT INTO shadow_repair_log (
                     session_id, failed_call_id, attribution_reason,
-                    dominant_signal, fix_candidate, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    dominant_signal, fix_candidate, timestamp,
+                    resolved, dry_run, applied, needs_human_review,
+                    attempt_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -515,6 +537,139 @@ class SessionStorage:
                     dominant_signal,
                     serialize_fix_candidate(fix_candidate),
                     now,
+                    int(resolved),
+                    int(dry_run),
+                    int(applied),
+                    int(needs_human_review),
+                    int(attempt_count),
+                ),
+            )
+            self._write_conn.commit()
+
+    def begin_shadow_repair(
+        self, session_id: int, failed_call_id: int
+    ) -> Optional[int]:
+        """Reserve a shadow slot under the write lock.
+
+        Returns the placeholder row id to finalize, or ``None`` if this
+        call was already logged or the session has hit the attempt cap
+        (a single give-up row is inserted in that case).
+        """
+        from .shadow import (
+            MAX_SHADOW_REPAIRS_PER_SESSION,
+            SHADOW_GIVE_UP_REASON,
+            SHADOW_IN_PROGRESS,
+            serialize_fix_candidate,
+        )
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self._write_lock:
+            existing = self._write_conn.execute(
+                """
+                SELECT id FROM shadow_repair_log
+                WHERE session_id = ? AND failed_call_id = ?
+                LIMIT 1
+                """,
+                (int(session_id), int(failed_call_id)),
+            ).fetchone()
+            if existing is not None:
+                return None
+            n = self._write_conn.execute(
+                "SELECT COUNT(*) FROM shadow_repair_log WHERE session_id = ?",
+                (int(session_id),),
+            ).fetchone()[0]
+            if int(n) >= int(MAX_SHADOW_REPAIRS_PER_SESSION):
+                flagged = self._write_conn.execute(
+                    """
+                    SELECT id FROM shadow_repair_log
+                    WHERE session_id = ? AND needs_human_review = 1
+                    LIMIT 1
+                    """,
+                    (int(session_id),),
+                ).fetchone()
+                if flagged is None:
+                    self._write_conn.execute(
+                        """
+                        INSERT INTO shadow_repair_log (
+                            session_id, failed_call_id, attribution_reason,
+                            dominant_signal, fix_candidate, timestamp,
+                            resolved, dry_run, applied, needs_human_review,
+                            attempt_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, 1, ?)
+                        """,
+                        (
+                            int(session_id),
+                            int(failed_call_id),
+                            SHADOW_GIVE_UP_REASON,
+                            None,
+                            serialize_fix_candidate({}),
+                            now,
+                            int(n) + 1,
+                        ),
+                    )
+                    self._write_conn.commit()
+                return None
+            cur = self._write_conn.execute(
+                """
+                INSERT INTO shadow_repair_log (
+                    session_id, failed_call_id, attribution_reason,
+                    dominant_signal, fix_candidate, timestamp,
+                    resolved, dry_run, applied, needs_human_review,
+                    attempt_count
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, 0, ?)
+                """,
+                (
+                    int(session_id),
+                    int(failed_call_id),
+                    SHADOW_IN_PROGRESS,
+                    None,
+                    serialize_fix_candidate({}),
+                    now,
+                    int(n) + 1,
+                ),
+            )
+            self._write_conn.commit()
+            return int(cur.lastrowid)
+
+    def finalize_shadow_repair_log(
+        self,
+        row_id: int,
+        attribution_reason: Optional[str],
+        dominant_signal: Optional[str],
+        fix_candidate: Any,
+        resolved: bool = False,
+        dry_run: bool = True,
+        applied: bool = False,
+        needs_human_review: bool = False,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        from .shadow import serialize_fix_candidate
+
+        now = timestamp or datetime.now(timezone.utc).isoformat()
+        with self._write_lock:
+            self._write_conn.execute(
+                """
+                UPDATE shadow_repair_log SET
+                    attribution_reason = ?,
+                    dominant_signal = ?,
+                    fix_candidate = ?,
+                    timestamp = ?,
+                    resolved = ?,
+                    dry_run = ?,
+                    applied = ?,
+                    needs_human_review = ?
+                WHERE id = ?
+                """,
+                (
+                    attribution_reason,
+                    dominant_signal,
+                    serialize_fix_candidate(fix_candidate),
+                    now,
+                    int(resolved),
+                    int(dry_run),
+                    int(applied),
+                    int(needs_human_review),
+                    int(row_id),
                 ),
             )
             self._write_conn.commit()
@@ -524,7 +679,9 @@ class SessionStorage:
         try:
             sql = """
                 SELECT id, session_id, failed_call_id, attribution_reason,
-                       dominant_signal, fix_candidate, timestamp
+                       dominant_signal, fix_candidate, timestamp,
+                       resolved, dry_run, applied, needs_human_review,
+                       attempt_count
                 FROM shadow_repair_log
                 ORDER BY id ASC
             """
@@ -534,7 +691,14 @@ class SessionStorage:
                 rows = conn.execute(sql).fetchall()
         finally:
             self._return_read_conn(conn)
-        return [dict(row) for row in rows]
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for flag in ("resolved", "dry_run", "applied", "needs_human_review"):
+                if flag in item and item[flag] is not None:
+                    item[flag] = bool(item[flag])
+            out.append(item)
+        return out
 
     def insert_shadow_attribution_log(
         self,

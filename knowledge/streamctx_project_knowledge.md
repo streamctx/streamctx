@@ -1,12 +1,12 @@
 ---
-knowledge_version: 2026-09-17.4
+knowledge_version: 2026-09-17.5
 last_updated: 2026-09-17
 pypi_version: 0.4.6
 source_repo: streamctx/streamctx
-source_commit: working-tree on cursor/layer2-attribution-hardening (parent b3b17b7)
+source_commit: working-tree on cursor/layer3-repair-hardening (parent ee9cc9d / Layer 2)
 canonical_branch: main
 reviewed: true
-review_note: Layer 1 section is the prior hardened tree. Layer 2 section regenerated from live attribution.py on cursor/layer2-attribution-hardening. Layer 1 PR is not merged to main as part of this pass. Canonical full-product copy for agents lives at streamctx-agents/knowledge/streamctx_project_knowledge.md.
+review_note: Layer 1 and Layer 2 sections are the prior hardened trees. Layer 3 section regenerated from live repair.py / shadow.py / storage.py on cursor/layer3-repair-hardening. Layers 1–3 PRs are not merged to main as part of this pass. Canonical full-product copy for agents lives at streamctx-agents/knowledge/streamctx_project_knowledge.md.
 ---
 
 # StreamCtx Layer 1 — Core SDK (verified)
@@ -14,11 +14,11 @@ review_note: Layer 1 section is the prior hardened tree. Layer 2 section regener
 Citation format: `path:start-end` relative to this SDK checkout.
 
 **Status:** SHIPPED in `src/streamctx/` of PyPI 0.4.6 / `main`. Hardened 2026-09-17
-(senior-bar + structural fixes). Layer 2 is re-audited in this file (section
-below). Layers 3–4 are shipped but **not** re-audited here.
+(senior-bar + structural fixes). Layer 2 and Layer 3 are re-audited in this file
+(sections below). Layer 4 is shipped but **not** re-audited here.
 
 Close-out: `knowledge/HARDENING.md` (Layer 1 — Core SDK hardening; Layer 2 —
-Attribution Engine hardening).
+Attribution Engine hardening; Layer 3 — Verified Auto-Repair hardening).
 
 ---
 
@@ -247,5 +247,160 @@ and shows `tracker.healing_stats()` as the example output. Code wins.
 | Full suite after this pass | **Yes** | `190 passed, 1 skipped` (live OpenAI key) |
 | Semantic drift with similar token counts and no waste flip | **Still assumed / weak** | Drift is still shape + waste, not embedding similarity. Same-length Lyon→Phoenix without a token jump can undershoot the floor. |
 | Error messages that do not match infra / extra / taxonomy needles | **Still assumed** | Unlabeled content failures still go through the three-weight heuristic. |
-| Layer 2 importing Layer 3 `classify_failure` | **Debt** | Layering inversion. Not moved this pass (Layer 3 out of scope). |
+| Layer 2 importing Layer 3 `classify_failure` | **Debt** | Layering inversion. Layer 3 hardening left the import and the binary contract unchanged (see Layer 3). |
 | Supabase `get_calls_for_session` attribution | **Not re-proven** | Tests use SQLite / fake storage. |
+
+---
+
+<!-- section: layer-3-repair -->
+# StreamCtx Layer 3 — Verified Auto-Repair (verified)
+
+Citation format: `path:start-end` relative to this SDK checkout.
+Audited 2026-09-17 against live `src/streamctx/repair.py`, `shadow.py`, and
+`storage.py` on `cursor/layer3-repair-hardening` (Layer 2 parent `ee9cc9d`,
+**not** merged to `main` in this pass). Prior knowledge-doc Layer 3 claims
+were not trusted; mechanisms below were re-derived from the code.
+
+**Status:** SHIPPED, MIT, free forever. No paid flag, license check, or
+hosted-only gate in `repair.py` / `shadow.py`. Close-out: `knowledge/HARDENING.md`.
+
+**`classify_failure()` contract:** unchanged. Still a binary
+`infra_error` / `content_error` function at `repair.py:130-151`. No third
+abstention token. Layer 2's `is_non_content_failure()` wrapper
+(`attribution.py:269-283`) is therefore still valid. Do not "fix" simulated
+failure / recursion / SDK-signature strings into `infra_error` without a
+coordinated Layer 2 change.
+
+Module: `src/streamctx/repair.py`. Public surface: `VerifiedRepairEngine`,
+`RepairResult`, `classify_failure()`, `is_unfixable_content_failure()`,
+`get_repair_engine()`, `verify_fix()` on the package. Shadow path:
+`src/streamctx/shadow.py`. Log table: `storage.py:128-142,506-691`.
+
+---
+
+## What `verify_fix()` actually does
+
+End-to-end (`repair.py:308-488`):
+
+1. Load the failed call. `classify_failure(error_message)` — if `infra_error`,
+   return unresolved, empty candidate, `applied=False` (`repair.py:347-355`).
+2. `AttributionEngine.attribute_failure()` (Layer 2). No root cause → unresolved,
+   `needs_human_review=True`. Layer 2 abstention (`infra/non-content`,
+   `unattributable`) stops the repair here.
+3. Generate a signal-based candidate (`repair.py:494-520`):
+   - **compression** → facts Layer 1 `compress_messages()` would drop from the
+     *attributed* uncompressed request, clipped around those facts
+     (`repair.py:543-591,1004-1031`). Not the earliest call.
+   - **drift** → re-anchor to earliest task framing.
+   - **recency** → re-surface earliest assigned task.
+   - unknown signal → empty candidate (no silent compression fallback).
+4. Counterfactual replay via `CounterfactualReplayer` (does **not** write
+   checkpoints or call rows).
+5. Live verification (`dry_run=False`) is **independent of the attribution
+   signal** (`repair.py:812-840`): `correct_value` must appear in the assistant
+   reply, must already exist in stored session messages, and the reply must
+   not be a copy of the `[STREAMCTX REPAIR …]` injection. Invented strings
+   that the LLM echoes do **not** resolve.
+6. Dry-run (default, and the only shadow path) never sets `resolved=True`.
+
+`applied` is always `False` from `verify_fix()`. There is no auto-apply API.
+A failed / timed-out replay leaves the original session untouched
+(`repair.py:1041-1065`, daemon-thread timeout `REPAIR_LLM_TIMEOUT_S=30`).
+Proof stores a pre-repair checkpoint fingerprint (`repair.py:842-850`).
+
+---
+
+## False-positive gate vs circular verification
+
+Pre-fix, `resolved=True` meant only "the caller-supplied `correct_value`
+appeared in the replay." An invented code (`ZEBRA-NOT-IN-SESSION-9917`) that
+the stub LLM echoed was accepted. That is circular: the check did not use
+session evidence.
+
+Post-fix independent checks, in order (`repair.py:812-840`):
+
+1. `correct_value` present in replay **reply** (not the injected system note).
+2. Every required value already present in stored `messages_json` for the session.
+3. Reply does not contain `[streamctx repair` and is not an 85%+ word overlap
+   with the injection (length ≥ 80).
+
+Absence of the old `error_message` is still **not** treated as success.
+
+---
+
+## Shadow log and opt-out
+
+`maybe_schedule_shadow_repair` (`shadow.py:53-83`) runs only when:
+
+- `STREAMCTX_SHADOW_REPAIR` is not `0`/`false`/`no`/`off` (default on)
+- `should_shadow_repair`: `classify_failure == content_error` **and**
+  `error_message` empty/None (`shadow.py:44-50`)
+
+So tracker exception failures (`_persist_failure` writes the exception text)
+do **not** shadow. Organic content-quality rows with empty `error_message`
+do. `STREAMCTX_SHADOW_REPAIR_SYNC=1` runs in-process (tests).
+
+Cap (`shadow.py:31`, `storage.py:549-631`): one row per `(session_id,
+failed_call_id)`; at most `DEFAULT_LOOKBACK` (5) verify_fix runs per session;
+further failures skip. Justified: more than one Layer-2 lookback window of
+unresolved auto-repairs is the same cause looping.
+
+Log columns after migration (`storage.py:186-191,128-142`): `resolved`,
+`dry_run`, `applied`, `needs_human_review`, `attempt_count`. Shadow is always
+`dry_run=True`, `applied=False`. `scripts/review_shadow_log.py` reads
+`$STREAMCTX_HOME/sessions.db` (default `~/.streamctx/sessions.db`). Proven
+2026-09-17: table exists, **0 rows** — consistent with zero organic
+content-quality failures in that DB.
+
+---
+
+## Layer 1 interaction
+
+- Failures persist to `calls` only (`tracker.py:653-680`); they do not move
+  the resume checkpoint. `_step_for_call` (`repair.py:660-689`) pairs
+  successes to checkpoints in order; a failure replays from the last success.
+  1:1 zip only when `len(checkpoints)==len(calls)` (seeded content-quality
+  rows that were checkpointed).
+- Compression repair replays Layer 1 `compress_messages()` on the attributed
+  uncompressed request, then injects windows around dropped dollar/decimal/
+  4+ digit / stable-ID facts. Earliest-call Lyon is not re-injected when the
+  later window has Phoenix / `$12.4`.
+- `persist_step` is not used to apply a repair. Resume after `verify_fix` is
+  the last valid success checkpoint, unchanged. Proven:
+  `test_live_restore_of_session_fact_is_resolved`,
+  `test_middle_failure_replays_from_last_success_checkpoint`.
+
+---
+
+## Paywall / license
+
+None in Layer 3. No `license_key`, `requires_pro`, `STREAMCTX_PAID`, or
+`if paid` in `src/streamctx/repair.py`. Proven:
+`tests/test_layer3_hardening.py::test_no_paid_gate_in_repair_source`.
+
+---
+
+## Proof vs still-assumed
+
+| Path | Proven? | How |
+| --- | --- | --- |
+| Invented `correct_value` does not resolve | **Yes** | `test_invented_correct_value_is_not_verified` |
+| Compression candidate contains dropped `$12.4`, not earliest framing | **Yes** | `test_compression_reinjects_dropped_fact_not_earliest` |
+| Stale Lyon is not re-injected when later window has Phoenix/$12.4 | **Yes** | `test_stale_earliest_city_is_not_re_injected` |
+| Injection echo is not verified | **Yes** | `test_injection_echo_is_not_verified` |
+| Session-grounded restore resolves, `applied=False`, checkpoints unchanged | **Yes** | `test_live_restore_of_session_fact_is_resolved` |
+| 12 content failures do not retry indefinitely (cap=5) | **Yes** | `test_repair_loop_gives_up_after_lookback_window` |
+| LLM hang returns in ~1s, session untouched | **Yes** | `test_llm_timeout_fail_safe` |
+| Failure between successes replays from last success step | **Yes** | `test_middle_failure_replays_from_last_success_checkpoint` |
+| `classify_failure` binary contract unchanged vs Layer 2 | **Yes** | `test_classify_failure_contract_unchanged_for_layer2` |
+| `STREAMCTX_SHADOW_REPAIR=0` writes nothing | **Yes** | `test_shadow_opt_out_env` + `tests/test_shadow_repair.py::test_shadow_disabled_env` |
+| Injected content-quality E2E (attr → shadow log → live verify) | **Yes** | `test_injected_content_quality_e2e_pipeline` |
+| 50-worker shadow log, no cross-session contamination | **Yes** | `test_concurrent_shadow_log_50_workers_no_contamination` |
+| `review_shadow_log.py` against `~/.streamctx/sessions.db` | **Yes** | 2026-09-17: db exists, `shadow_repair_log` empty |
+| Shadow-run `verify_fix(dry_run=True)` on real `sessions.db` | **Yes** | 1,360 failed; 20 seeded excluded; **1,340** real. `classify_failure`: **161** `infra_error`, **1,179** `content_error`. All 1,179 dry-run ok, 0 errors, conf 0.0, signal none. Attribution then abstains: recursion 642 + simulated 484 + sdk_signature 44 = 1,170 `infra/non-content`; 9 prompt-injection `unattributable`. **Zero organic content-quality repairs.** Do not reuse 1,264. |
+| Full suite after this pass | **Yes** | `python -m pytest tests/ --tb=line -q` → **206 passed, 1 skipped** |
+| Auto-apply of a verified candidate into the live session | **Not shipped** | Explicitly `applied=False`. Safer than applying; Layer 4 will audit whatever was *not* applied. |
+| Tracker intercept flagging a successful hallucination as `failed=True` with empty `error_message` | **Still assumed / dead in intercept** | Success path persists `failed=False`. Shadow only fires on explicit `record_call(failed=True, error_message=None)` (or equivalent). Organic path remains unproven against live tracker hallucinations. |
+| Semantic "the reply used the restored fact correctly" beyond substring match | **Still assumed / weak** | Independent gate is evidence + echo, not an NLI check. |
+| Supabase shadow_repair_log | **Not shipped** | SQLite-only. |
+| Layer 4 / `deploy/streamlit-cloud` / merge to `main` | **Not this pass** | Explicitly out of scope. |

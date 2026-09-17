@@ -204,3 +204,64 @@ Judged against live `src/streamctx/attribution.py` before the structural change.
 | `deploy/streamlit-cloud` / Layer 1 merge to `main` | **Not this pass** | Explicitly out of scope. |
 
 Layer 3 product code was not edited. `tests/test_repair.py` seeders were updated so they construct real drift/compression/recency mechanisms; the repair API is unchanged.
+
+---
+
+# Layer 3 — Verified Auto-Repair hardening
+
+Date: 2026-09-17
+SDK parent: `ee9cc9d` on `cursor/layer2-attribution-hardening` (not merged to `main` in this pass). Layer 3 fixes are on `cursor/layer3-repair-hardening`.
+
+No part of Layer 3 is gated behind a paid tier. `repair.py` / `shadow.py` have no license check, paid flag, or hosted-only branch. Core repair stays MIT.
+
+**`classify_failure()` contract did not change.** Binary `infra_error` / `content_error` at `repair.py:130-151`. Layer 2's `is_non_content_failure()` wrapper needs no update. Simulated failure / recursion / SDK-signature strings remain `content_error` here and `infra/non-content` in Layer 2.
+
+## Senior-bar results against pre-fix code
+
+Judged against live `src/streamctx/repair.py` before the structural change. Probe: `scripts/layer3_senior_bar_pre.py`. Same bar as Layers 1–2 (do not round "weak" up to "works"):
+
+| Case | Pre-fix verdict | What actually happened |
+| --- | --- | --- |
+| Circular verification (invented `correct_value`) | **FAIL** | Stub LLM echoed `ZEBRA-NOT-IN-SESSION-9917`. `resolved=True`. Gate was "substring in reply," same channel as the injection, no session-evidence check. |
+| Compression re-injects dropped fact | **FAIL** | Dominant `compression`, but candidate was earliest-call framing (`original task: summarize…`). `$12.4` absent. |
+| Stale earliest vs later Phoenix/$12.4 | **FAIL** | Compression repair injected **Lyon** from call 0. Phoenix / `$12.4` from the uncompressed later window were not restored. Compression had correctly dropped the superseded city; repair put it back. |
+| Repair-loop backoff | **FAIL** | 12 content-quality persists → 12 shadow rows. No cap, no `needs_human_review` column. |
+| Partial repair vs Layer 1 resume | **PASS** | `verify_fix` never wrote checkpoints/calls. Vacuous fail-safe: repairs are not applied. |
+| Failure-without-checkpoint step mapping | **PASS** (end-failure layout) | Fallback used last checkpoint. Middle-failure ordinal zip was still wrong in code; fixed anyway (`repair.py:660-689`). |
+| LLM timeout fail-safe | **FAIL** | Hung `llm_fn` ran to completion (6s in the probe). No timeout. Replay error path existed only after the call returned. |
+| `classify_failure` vs Layer 2 | **PASS** | Binary contract held. `simulated failure` still `content_error` here, `is_non_content_failure=True` in Layer 2. No abstention token in `classify_failure` itself. |
+| Never auto-applied | **PASS** | Shadow + `verify_fix` are counterfactual. Live session not mutated. |
+| 50-worker shadow log (sequential SYNC) | **PASS** | 50 rows, 0 session/call mismatches. Concurrent 50-worker proof is in the post-fix test. |
+
+The remaining holes were (1) verification that accepted an invented echo, (2) compression sourcing the earliest call, (3) no session attempt cap, (4) no LLM timeout, (5) `shadow_repair_log` not recording `resolved`/`applied`/`needs_human_review`.
+
+## Root-cause fixes (not one-test special cases)
+
+1. **Independent verification.** `_independent_verification` (`repair.py:812-840`) requires `correct_value` in the replay reply **and** in stored session messages **and** not an injection echo. Breaks circular "the model repeated the string we just asked it to repeat" when that string was never in the session.
+2. **Compression restores dropped facts.** `_dropped_source_snippets` replays Layer 1 `compress_messages()` on the attributed uncompressed request and clips windows around dropped dollar/decimal/4+ digit/stable-ID facts (`repair.py:543-591,1004-1031`). Earliest-call fallback removed. Unknown signals no longer silently generate a DEDUPE note.
+3. **Never mutate live state.** `applied=False` on every `RepairResult`. Proof stores a pre-repair checkpoint fingerprint. Timeout via a daemon thread (`REPAIR_LLM_TIMEOUT_S=30`, `repair.py:1041-1065`) returns `resolved=False`, `needs_human_review=True`, original rows untouched. Fail-safe is snapshot-and-don't-write, not rollback-after-write.
+4. **Give-up cap = Layer 2 lookback.** `MAX_SHADOW_REPAIRS_PER_SESSION = DEFAULT_LOOKBACK` (5). One log row per failed call; slot reserved under the write lock (`storage.py:549-631`). More than one lookback window of auto-repairs is a loop.
+
+## Proof vs still-assumed
+
+| Path | Proven? | How |
+| --- | --- | --- |
+| Invented value does not resolve | **Yes** | `tests/test_layer3_hardening.py::test_invented_correct_value_is_not_verified` |
+| Compression candidate has `$12.4`, not earliest task | **Yes** | `test_compression_reinjects_dropped_fact_not_earliest` |
+| Lyon not re-injected when later window has Phoenix/$12.4 | **Yes** | `test_stale_earliest_city_is_not_re_injected` |
+| Injection echo rejected | **Yes** | `test_injection_echo_is_not_verified` |
+| Live restore + checkpoints unchanged | **Yes** | `test_live_restore_of_session_fact_is_resolved` |
+| 12 failures cap at 5 | **Yes** | `test_repair_loop_gives_up_after_lookback_window` |
+| LLM timeout ~1s, session untouched | **Yes** | `test_llm_timeout_fail_safe` |
+| Middle failure `from_step` = last success | **Yes** | `test_middle_failure_replays_from_last_success_checkpoint` |
+| `classify_failure` contract unchanged | **Yes** | `test_classify_failure_contract_unchanged_for_layer2` |
+| Opt-out `STREAMCTX_SHADOW_REPAIR=0` | **Yes** | `test_shadow_opt_out_env`; `review_shadow_log.py` on real db is empty |
+| Injected content-quality E2E | **Yes** | `test_injected_content_quality_e2e_pipeline` |
+| 50-worker concurrent shadow fidelity | **Yes** | `test_concurrent_shadow_log_50_workers_no_contamination` |
+| Shadow-run vs `~/.streamctx/sessions.db` | **Yes** | 1,340 real failed rows. `classify_failure`: 161 infra + 1,179 content. All 1,179 dry-run ok, conf 0, signal none (Layer 2 abstains). Zero organic content-quality repairs. |
+| Full suite | **Yes** | `python -m pytest tests/ --tb=line -q` → **206 passed, 1 skipped** |
+| Auto-apply into live session | **Not shipped** | By design. |
+| Tracker success-path hallucination → shadow | **Still assumed / dead in intercept** | Intercept persists successes as `failed=False`. |
+| Layer 4 / `deploy/streamlit-cloud` / merge to `main` | **Not this pass** | Explicitly out of scope. |
+
+`classify_failure()` was not moved out of Layer 3. Layer 2 still imports it. That layering inversion remains debt; this pass refused to change the function's meaning to "fix" it.
