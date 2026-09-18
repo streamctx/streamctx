@@ -1,12 +1,12 @@
 ---
-knowledge_version: 2026-09-18.3
+knowledge_version: 2026-09-18.4
 last_updated: 2026-09-18
 pypi_version: 0.4.6
 source_repo: streamctx/streamctx
-source_commit: 98c7f03
+source_commit: 4047f58
 canonical_branch: main
 reviewed: true
-review_note: Regenerated from fully-merged main after Layers 1–4 merges, then updated for the Layer 1 blank-but-billed intercept fix and the Layer 1/2 session-grounded fact-contradiction review (2026-09-18). Citations are against this tree. Canonical full-product copy for agents lives at streamctx-agents/knowledge/streamctx_project_knowledge.md.
+review_note: Regenerated from fully-merged main after Layers 1–4 merges, blank-reply + fact-review follow-ups, and the 2026-09-18 final polish (atomic intent, classify_failure move, README compression range, attribution reconcile, streamlit-cloud merge). Citations are against this tree. Canonical full-product copy for agents lives at streamctx-agents/knowledge/streamctx_project_knowledge.md.
 ---
 
 # StreamCtx Layer 1 — Core SDK (verified)
@@ -165,12 +165,10 @@ Module: `src/streamctx/attribution.py`. Public surface: `AttributionEngine`,
 weights `DRIFT_WEIGHT=0.5` / `COMPRESSION_WEIGHT=0.3` / `RECENCY_WEIGHT=0.2`
 (`src/streamctx/attribution.py:41-43`).
 
-`classify_failure()` does **not** live in `attribution.py`. It lives in
-Layer 3 `src/streamctx/repair.py:130-151`. Layer 2 wraps it via
-`is_non_content_failure()` (`attribution.py:269-283`) plus extra SDK /
-load-test needles (`attribution.py:79-86`). That import is a layering
-inversion (Layer 2 → Layer 3). Left in place; Layer 3 did not change the
-binary contract. Not a paywall.
+`classify_failure()` lives in `src/streamctx/failure.py` (below Layer 2 and
+Layer 3). Layer 2 wraps it via `is_non_content_failure()`
+(`attribution.py`) plus extra SDK / load-test needles. `repair.py`
+re-exports the same function. Binary contract unchanged. Not a paywall.
 
 ---
 
@@ -287,7 +285,7 @@ and shows `tracker.healing_stats()` as the example output. Code wins.
 | Semantic drift with similar token counts and no waste flip | **Still assumed / weak** | Drift is still shape + waste, not embedding similarity. Same-length Lyon→Phoenix without a token jump can undershoot the floor. |
 | Success-path session-grounded ID/$ contradiction | **Yes (review, not failed)** | `tests/test_fact_contradiction.py`; live paraphrase/update clean; injected wrap fires. Not a world-knowledge hallucination detector. |
 | Error messages that do not match infra / extra / taxonomy needles | **Still assumed** | Unlabeled content failures still go through the three-weight heuristic. |
-| Layer 2 importing Layer 3 `classify_failure` | **Debt** | Layering inversion. Layer 3 hardening left the import and the binary contract unchanged (see Layer 3). |
+| Layer 2 importing Layer 3 `classify_failure` | **Closed 2026-09-18** | Function lives in `src/streamctx/failure.py`. Attribution does not import repair. `repair.py` re-exports. Proven: `test_attribution_module_does_not_import_repair`, `test_classify_failure_shared_object`. |
 | Supabase `get_calls_for_session` attribution | **Not re-proven** | Tests use SQLite / fake storage. |
 
 ---
@@ -444,7 +442,7 @@ None in Layer 3. No `license_key`, `requires_pro`, `STREAMCTX_PAID`, or
 | Blank-but-billed (`content` empty, reported output tokens > 0, no tool call) | **Yes** | Intercept `_is_blank_billed_reply`. Live proof: 3 organic blanks → failed, shadow, ledger. |
 | Semantic "the reply used the restored fact correctly" beyond substring match | **Still assumed / weak** | Independent gate is evidence + echo, not an NLI check. |
 | Supabase shadow_repair_log | **Not shipped** | SQLite-only. |
-| `deploy/streamlit-cloud` | **Not this pass** | Deploy branch HEAD `76ee241` is still not on `main`. |
+| `deploy/streamlit-cloud` | **Merged 2026-09-18** | `4047f58`. Cloud config only. |
 | Merge of Layers 1–4 into `main` | **Done 2026-09-18** | Real `--no-ff` merges `83b474f` / `8c4d2ce` / `dc9bf02` / `98c7f03`. |
 
 ---
@@ -479,8 +477,10 @@ Source: `src/streamctx/evidence.py:210-223`.
 `prev_hash` **is** in the signed preimage. Reordering or dropping a committed
 row breaks the successor. A write that was never attempted is **not** visible
 to the hash chain; use `reconcile_shadow_log()` against `shadow_repair_log`
-for Layer 3 omissions. Attribution has no independent table.
-Source: `src/streamctx/evidence.py:1117-1152`.
+for Layer 3 omissions and `reconcile_attribution_log()` against
+`shadow_attribution_log` for computed Layer 2 rows. An attribution that
+was never computed is still invisible.
+Source: `src/streamctx/evidence.py` (`reconcile_shadow_log`, `reconcile_attribution_log`).
 
 ## Applied vs verified (was a FAIL; now first-class signed fields)
 
@@ -579,9 +579,9 @@ chain valid, ledger rows == payload rows).
 | Kill-9: `integrity_check=ok`, equal ledger/payload counts, intent or valid chain | **Yes** | `test_kill9_mid_write_fail_safe` |
 | Shadow log without evidence row is reconcilable | **Yes** | `test_silent_omission_is_detectable_against_shadow_log` |
 | Full suite after this pass | **Yes** | Merged `main` (`98c7f03`): `python -m pytest tests/ -v --tb=short` → **221 passed, 1 skipped** |
-| Never-attempted Layer 2 attribution (no independent table) | **Still assumed / weak** | Hash chains cannot prove completeness of events never presented to the logger. `safe_append_evidence` swallows errors by contract and no-ops when `STREAMCTX_EVIDENCE_PRIVATE_KEY` is unset (`evidence.py:1201-1212`). |
+| Never-computed Layer 2 attribution | **Still assumed / weak** | Independent log now exists for attributions that *were* computed (`reconcile_attribution_log`). Events never presented to the engine remain invisible. `safe_append_evidence` still no-ops when `STREAMCTX_EVIDENCE_PRIVATE_KEY` is unset. |
 | Power-loss (not process kill) with `synchronous=FULL` | **Still assumed** | SQLite FULL+WAL survives `kill -9`; a hard power cut can still lose the last COMMIT. Intent file is best-effort. |
-| `deploy/streamlit-cloud` | **Not this pass** | Deploy branch HEAD `76ee241` is still not on `main`. |
+| `deploy/streamlit-cloud` | **Merged 2026-09-18** | `4047f58`. Cloud config only. |
 | Merge of Layers 1–4 into `main` | **Done 2026-09-18** | Real `--no-ff` merges ending at `98c7f03`. |
 | Live 15-turn organic session + injected four-layer event | **Yes** | `scripts/live_full_pipeline_proof.py` on `98c7f03`. Organic: 15/15 success, empty attestation verifies. Injected: compression → shadow dry-run + live `verified_not_applied`, `applied_count=0`, pinned verify exit 0. |
 | Blank `message.content` with `output_tokens>0` | **Closed 2026-09-18** | Intercept marks `failed=True` with empty `error_message`. Tool-call-only and refusals stay success. Empty + *zero reported* tokens is **not** this failure. Live: 3/3 organic blanks failed, 0 left as success. |

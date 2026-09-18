@@ -124,7 +124,7 @@ Corrupt-checkpoint walk: `valid=0`, invalid JSON, and non-list payloads are skip
 | Identical live prompts still count as two calls | **Yes** | `test_identical_live_prompts_are_two_calls_not_deduped` + `test_wrap_without_double_counting` |
 | Buried `ACME-9917` / `staging-db-07` survive compression | **Yes** | `test_compression_preserves_buried_constraint` |
 | Intercept sends compressed outbound messages | **Yes** | `test_intercept_sends_compressed_messages_and_keeps_constraint` |
-| Compression % on >1 session shape | **Yes (measured)** | chatter 79%, tool-heavy 80%, buried-constraint 88% (`max_tokens=800`, `keep_last_n=4`, char/4 heuristic). Marketing "40-70%" is a lower band, not a ceiling. README still says 30-60%. |
+| Compression % on >1 session shape | **Yes (measured)** | chatter 79%, tool-heavy 80%, buried-constraint 88% (`max_tokens=800`, `keep_last_n=4`, char/4 heuristic). Marketing "40-70%" is a lower band, not a ceiling. README now states 40-88% (`5a7d5c0`). |
 | Two corrupt checkpoints fall through to a third | **Yes** | `test_healer_falls_through_two_corrupt_checkpoints` |
 | Intercept retries after transient failure | **Yes** | `test_intercept_retries_with_previous_valid_context` |
 | Failed call does not become the resume point | **Yes** | `test_failed_call_does_not_move_resume_checkpoint` |
@@ -264,7 +264,7 @@ The remaining holes were (1) verification that accepted an invented echo, (2) co
 | Tracker success-path hallucination → shadow | **Review, not failure** | Non-empty wrong text is still `failed=False` (no Layer 3 shadow repair). Session-grounded ID/$ contradiction now writes `shadow_attribution_log` with `failure_kind=stable_fact_review`. |
 | Layer 4 / `deploy/streamlit-cloud` / merge to `main` | **Not this pass** | Explicitly out of scope. |
 
-`classify_failure()` was not moved out of Layer 3. Layer 2 still imports it. That layering inversion remains debt; this pass refused to change the function's meaning to "fix" it.
+`classify_failure()` was not moved out of Layer 3 **in this Layer 3 pass**. Polish `315ac16` later moved it to `failure.py`; Layer 2 no longer imports repair.
 
 ---
 
@@ -474,7 +474,7 @@ Layers 2–4 unchanged. Empty-error `content_error` already shadows.
 # Layer 1/2 — Session-grounded fact review (not a hallucination detector)
 
 Date: 2026-09-18
-SDK parent: uncommitted on merged `main` after `98c7f03` (blank-reply intercept already in the tree).
+SDK parent: merged `main` (`4fae5a9`).
 
 ## Step 0 — What is actually detectable
 
@@ -564,5 +564,67 @@ Deliberately not attempted:
 A system that says it catches X and Y and does not attempt Z because Z needs ground truth it does not have is more trustworthy than one that implies a hallucination detector.
 
 **Verdict:** the narrow session-grounded check survived the senior-bar cases and is shipped as a Layer 2 review signal. The "said something wrong about the world" case remains out of scope on purpose.
+
+---
+
+# Final polish — remaining small items (Layers 1–4)
+
+Date: 2026-09-18
+HEAD after this pass: `4047f58` on `main`.
+
+Each item is a separate commit. Full suite after the code items: **259 passed, 1 skipped**.
+
+## Item 1 — Flaky kill-9 test — PASS
+
+`test_kill9_mid_write_fail_safe` failed 6/50 before the fix, **all** `unreadable_intent`. Cause: `_write_intent` truncated the live `.intent` path (`O_TRUNC`) then wrote+fsync. Kill between truncate and a complete write left `{` or empty JSON.
+
+Fix (`1ab301c`): write `.intent.tmp`, fsync, `os.replace` onto `.intent`. Readers see a complete previous intent or a complete new one. Leftover `.tmp` is deleted with the intent. Garbage files still report `unreadable_intent` (`test_torn_intent_file_is_unreadable`).
+
+After fix: **0/50** failures. Not a sleep/retry.
+
+## Item 2 — Commit and push fact-contradiction — PASS
+
+`4fae5a9` on `origin/main`. Includes the blank-reply intercept that already lived in the same `tracker.py` diff (needed for a green tree). Pushed `b4cad0d..4fae5a9`.
+
+## Item 3 — Layer 2 → Layer 3 import direction — PASS
+
+`classify_failure()` moved to `src/streamctx/failure.py` (`315ac16`). Layer 2 and Layer 3 both import from there. `repair.py` re-exports so `from streamctx.repair import classify_failure` is unchanged. Proven: `test_classify_failure_shared_object` (`a is b`), `test_attribution_module_does_not_import_repair`, existing classify contract tests. No behavior change.
+
+## Item 4 — README compression numbers — PASS
+
+`5a7d5c0`. README now states **40–88% depending on session shape** (chatter 79%, tool-heavy 80%, buried-constraint 88%; 40–70% is the lower band). The old 30–60% figure is gone from the feature list, API cheat sheet, comparison table, and roadmap.
+
+## Item 5 — Reconcile Layer 2 attributions — PASS (with the stated limit)
+
+`9c402fd`. `_finish` writes `shadow_attribution_log` for every computed attribution. `reconcile_attribution_log()` matches `(session_id, failed_call_id)` against ledger `record_type='attribution'`, same pattern as Layer 3.
+
+**Closes:** computed but not ledger-persisted (no key, swallowed `safe_append_evidence`). Proven: `test_reconcile_attribution_log_detects_computed_but_unlogged`, `test_reconcile_attribution_log_matches_when_persisted`.
+
+**Does not close:** an attribution that was never computed. Hash chains cannot prove completeness of events never presented to the logger. Same limit as Layer 3.
+
+## Item 6 — `deploy/streamlit-cloud` — PASS (merged)
+
+Branch unique commit `76ee241` was Cloud deploy config only: Streamlit secrets, repo-relative `STREAMCTX_HOME`, `streamlit_requirements.txt`, pins. No SDK logic. Merged `--no-ff` as `4047f58`. One conflict: `.gitignore` kept both `artifacts/` (main) and `.streamctx_demo/` + `.streamlit/secrets.toml` (deploy). `requirements.txt` auto-merged (`cryptography` from main + Cloud pins).
+
+## Item 7 — Supabase evidence path — NOT PROVEN (explicit)
+
+Layer 4 `EvidenceLedger` is **SQLite-only** (`evidence_ledger.db`). There is no Supabase evidence backend to run tamper/kill-9 proofs against.
+
+`SupabaseStorage` (`src/streamctx/supabase_storage.py`) is a **session** backend (calls/checkpoints). It does not implement `get_calls_for_session`, `persist_step`, shadow logs, or an evidence ledger. A live `SUPABASE_URL` in `.env` does not make Layer 4 testable on Supabase.
+
+Honest status: Layer 4 tamper/concurrency/kill-9 proofs remain SQLite-only. Session Supabase is a separate, older surface and was not proven in this pass.
+
+## Capability boundaries unchanged by this pass
+
+Still out of scope, on purpose:
+
+- General factual correctness / world-knowledge hallucination detection
+- New ID families, bare numbers, years, audio/image-only assistant payloads
+- OpenAI Responses API (intercept is still `chat.completions` + Anthropic `messages.create`)
+- Auto-apply of Layer 3 repairs (`applied=False`)
+- Completeness of events never computed (Item 5 limit)
+
+`__init__.py` `compress()` docstring still says "40-70%" (public API string; not this README pass).
+
 
 
