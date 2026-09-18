@@ -492,7 +492,7 @@ class SessionStorage:
                     SELECT id, session_id, timestamp, provider, model,
                            input_tokens, output_tokens, cost,
                            reused_tokens, waste_category, messages_json,
-                           failed, healed, error_message
+                           failed, healed, error_message, response_text
                     FROM calls
                     WHERE session_id = ?
                     ORDER BY id ASC

@@ -261,7 +261,7 @@ The remaining holes were (1) verification that accepted an invented echo, (2) co
 | Shadow-run vs `~/.streamctx/sessions.db` | **Yes** | 1,340 real failed rows. `classify_failure`: 161 infra + 1,179 content. All 1,179 dry-run ok, conf 0, signal none (Layer 2 abstains). Zero organic content-quality repairs. |
 | Full suite | **Yes** | `python -m pytest tests/ --tb=line -q` → **206 passed, 1 skipped** |
 | Auto-apply into live session | **Not shipped** | By design. |
-| Tracker success-path hallucination → shadow | **Still assumed / dead in intercept** | Intercept persists successes as `failed=False`. |
+| Tracker success-path hallucination → shadow | **Review, not failure** | Non-empty wrong text is still `failed=False` (no Layer 3 shadow repair). Session-grounded ID/$ contradiction now writes `shadow_attribution_log` with `failure_kind=stable_fact_review`. |
 | Layer 4 / `deploy/streamlit-cloud` / merge to `main` | **Not this pass** | Explicitly out of scope. |
 
 `classify_failure()` was not moved out of Layer 3. Layer 2 still imports it. That layering inversion remains debt; this pass refused to change the function's meaning to "fix" it.
@@ -326,7 +326,243 @@ The remaining holes were (1) exporting opaque hashes so applied/verified could n
 | Full suite | **Yes** | `python -m pytest tests/ --tb=line -q` → **221 passed, 1 skipped** |
 | Completeness of never-attempted Layer 2 attributions | **Still assumed / weak** | No independent attribution table. `safe_append_evidence` swallows errors so Layer 2/3 never break. |
 | Power-loss (not process kill) | **Still assumed** | Same SQLite limit as Layer 1. |
-| `deploy/streamlit-cloud` / merge of Layers 1–4 into `main` | **Not this pass** | Explicitly out of scope. |
+| `deploy/streamlit-cloud` | **Not this pass** | Deploy branch HEAD `76ee241` is still not on `main`. |
+| Merge of Layers 1–4 into `main` | **Done later** | Integration close-out 2026-09-18, merge `98c7f03`. |
 
 Schema 1.0 bundles remain verifiable. Prefer a 1.1 re-export: 1.0 session slices break under interleaving, and 1.0 cannot show `applied=false` without the raw payload.
+
+---
+
+# Integration close-out — all four layers on `main`
+
+Date: 2026-09-18
+SDK HEAD: `98c7f03` on `main`
+
+## Part A — merges
+
+Real `--no-ff` merge commits, in chain order, same discipline as `b25bab1` (`release/v0.4.6` into `main`). No squash. **Conflicts: none** (linear chain, each branch 1 commit ahead of the previous tip).
+
+| Order | Branch | Content commit | Merge commit | Parents | Post-merge suite |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `cursor/layer1-core-sdk-hardening` | `b3b17b7` | `83b474f` | `b4cad0d` + `b3b17b7` | **178 passed, 1 skipped** |
+| 2 | `cursor/layer2-attribution-hardening` | `ee9cc9d` | `8c4d2ce` | `83b474f` + `ee9cc9d` | **190 passed, 1 skipped** |
+| 3 | `cursor/layer3-repair-hardening` | `e432cb7` | `dc9bf02` | `8c4d2ce` + `e432cb7` | **206 passed, 1 skipped** |
+| 4 | `cursor/layer4-evidence-hardening` | `7443e5f` | `98c7f03` | `dc9bf02` + `7443e5f` | **221 passed, 1 skipped** |
+
+Final suite on merged `main` (same tree as the Layer 4 post-merge run):
+
+```
+python -m pytest tests/ -v --tb=short
+221 passed, 1 skipped in 36.43s
+```
+
+Skipped: `tests/test_openai_integration.py::TestOpenAILive::test_real_openai_call` (needs `OPENAI_API_KEY`; this machine had OpenRouter only).
+
+Knowledge doc regenerated against this tree: `knowledge/streamctx_project_knowledge.md`, `knowledge_version: 2026-09-18.1`, `source_commit: 98c7f03`.
+
+## Part B — live pipeline proof
+
+Script: `scripts/live_full_pipeline_proof.py`. Isolated `STREAMCTX_HOME=artifacts/integration-proof`, Ed25519 keypair generated there, `STREAMCTX_EVIDENCE_PRIVATE_KEY` set (without it Layer 4 `safe_append_evidence` is a silent no-op). Compression default patched to `max_tokens=400` so Layer 1 compression/reuse could fire. Provider: OpenRouter `openrouter/free`. 15 turns.
+
+### Organic session (`session_id=1`)
+
+Did **not** force a failure.
+
+| Layer | What actually happened |
+| --- | --- |
+| 1 | 15 calls, 15 checkpoints, 0 failed, 0 healed. `reused_tokens` 49 → 827. Report: 10,554 tokens, 45% cached/reused, biggest waste = repeated system prompt. |
+| 2 | Never invoked by intercept. `failed=0`. |
+| 3 | `shadow_repair_log` empty. |
+| 4 | `export_attestation(1)` → schema 1.1, **0 entries**, `repair_summary` all zeros. Fresh-process `verify_attestation.py --public-key issuer.pem --verbose` **exit 0**, AUTHENTICITY PINNED. |
+
+Honest content outcome: 7 of 15 turns stored `response_text=''` with `failed=0` and `output_tokens=220` (calls 4, 5, 6, 9, 11, 14, 15). Last-turn fact check was False because the last reply was empty, not because Layer 1 dropped `ACME-9917` / `staging-db-07` / `$12.4`. Turn 12 stored `"From Turn 1: ticket ACME"` (truncated). Turn 13 stored a chain-of-thought dump, not the three values. `_response_text` only reads `choices[0].message.content` (`tracker.py:187-201`). Empty `content` with billed output tokens is still a success row.
+
+The empty attestation is an **accurate picture of the ledger** (no attribution/repair events). An outside auditor would not learn that seven replies were blank. That is the success-path gap, now seen live.
+
+### Injected session (`session_id=2`, labeled injected)
+
+One content-quality row: `persist_step` success + `record_call(failed=True, error_message=None)` with a buried `$12.4 million` and a `$47.3 million` hallucination. Shadow sync on.
+
+| Layer | What actually happened |
+| --- | --- |
+| 1 | 2 calls. Success checkpointed. Failure: `failed=1`, `input_tokens=0`, `reused_tokens=0`, `error_message=None`. Shadow scheduled from `record_call`. |
+| 2 | `attribute_failure`: dominant compression (raw 0.884), drift 0.698, recency-why 0.0, confidence 0.6144, root=`call_id=17` (the failing row itself). Did **not** abstain. |
+| 3 | Shadow: `signal=compression`, `dry_run=True`, `resolved=False`, `applied=False`, candidate contains `12.4`. Live `verify_fix(dry_run=False)` with a stub LLM that restored `$12.4 million`: `resolved=True`, `applied=False`. Checkpoints of the live session were not the apply target. |
+| 4 | Bundle: 5 entries (3 attribution + 2 repair — extra attributions are from the proof script calling `attribute_failure` / `verify_fix` again, each `_finish` appends). `repair_summary`: `applied=0`, `verified_not_applied=1`, `unresolved_not_applied=1`. Offline verify **exit 0**, PINNED, note "no bundled repair was applied". `reconcile_shadow_log` `complete=True`. |
+
+An outside auditor reading only the injected bundle would correctly conclude: one shadow dry-run that did not resolve, one later shadow-verify that resolved and was **not applied**, and that nothing was written into a live session. That matches what happened.
+
+## Part C — verdict
+
+The merged pipeline **works end-to-end on the paths it claims**: Layer 1 persists and compresses; when a content-quality row is actually marked `failed=True` with empty `error_message`, Layer 2 attributes, Layer 3 shadow-verifies without applying, Layer 4 exports a pinned bundle an independent process accepts, and `applied=false` is unambiguous.
+
+It does **not** round up to "the live conversation was fully observed." Organic usage on this provider produced blank replies that Layer 1 stored as successes, so Layers 2–4 correctly had nothing to say. That is not a merge-conflict bug; it is a cross-layer contract the four individual passes left as "dead in intercept," now confirmed on a real 15-turn session.
+
+### New finding (not covered as its own case in Layers 1–4)
+
+**Blank `message.content` with `output_tokens > 0` is a success.** Live OpenRouter turns billed 220 output tokens, stored `response_text=''`, `failed=False`, and moved the resume checkpoint. Layer 3's "success-path hallucination" note assumed *wrong text*; this is *no text*. **Fixed in the Layer 1 blank-reply pass below.** Not fixed in the integration pass itself.
+
+### Not new
+
+- Organic sessions rarely produce `failed=True` content rows. Reconfirmed.
+- `STREAMCTX_EVIDENCE_PRIVATE_KEY` unset → Layer 4 logs nothing. By contract (`evidence.py:1201-1212`).
+- `deploy/streamlit-cloud` (`76ee241`) is still not on `main`.
+- Ledger appends once per `attribute_failure`/`verify_fix` call, not once per failed_call_id. Attempt log, not unique-event log.
+
+Do not ship a claim that "the attestation is a complete record of the conversation." It is a complete record of **attribution and repair attempts that were presented to the logger**.
+
+---
+
+# Layer 1 — Blank-reply blind spot
+
+Date: 2026-09-18
+SDK parent: merged `main` after `98c7f03`. Fix is uncommitted on top of that tree unless committed separately.
+
+## What was wrong
+
+`failed` was set only when `fn()` raised (`tracker.py` intercept). A 200 with empty `choices[0].message.content` always took `_persist_success`, which **hardcodes** `failed=False`. `_response_text` did not read `refusal`, Anthropic text blocks, or tool payloads. Billed empty replies moved the checkpoint and were invisible to Layers 2–4.
+
+Same decision path for OpenAI-style (`wrap` / SDK patch → `provider="openai"`) and Anthropic-style (`provider="anthropic"`). Anthropic had a slightly better content extractor but still never set `failed` from content.
+
+## What counts as this failure
+
+| Shape | `failed` | Why |
+| --- | --- | --- |
+| Empty/`None`/whitespace content, **provider-reported** output tokens > 0, no tool call | **True** | Observed live defect. `error_message=None` so shadow fires. Checkpoint not moved. Usage kept. |
+| Empty content, reported output tokens = 0, or missing usage | **False** | Not billed; stubs and no-ops. Still open as a different mode. |
+| `tool_calls` / legacy `function_call` / Anthropic `tool_use`, even with empty text | **False** | Valid response shape. |
+| Non-empty `refusal` | **False** | Visible text; stored as `response_text`. |
+| Reasoning/thinking only, billed, no visible text | **True** | Not user-visible. Same as the live miss. |
+| Non-empty wrong text (hallucination) | **False** | Not an automatic failure. Session-grounded ID/$ contradiction is a Layer 2 review signal (see close-out below). |
+
+Billed means `usage.completion_tokens` / `usage.output_tokens` from the provider, **not** the `len//4` estimate. Tests without usage must not trip this gate.
+
+## Fix
+
+`_is_blank_billed_reply` in the intercept after a non-exception response (`tracker.py:261-365,749-775`). Hits `_persist_failure` with empty `error_message` and real token counts. `_persist_success` is not used (it still hardcodes `failed=False`). Response is returned to the caller. No auto-retry (unlike exceptions).
+
+Layers 2–4 unchanged. Empty-error `content_error` already shadows.
+
+## Proof
+
+| Path | Proven? | How |
+| --- | --- | --- |
+| Blank + billed → failed, no checkpoint | **Yes** | `test_blank_billed_reply_is_failed_and_does_not_move_checkpoint` |
+| `content=None` billed | **Yes** | `test_blank_none_content_billed_is_failed` |
+| Whitespace billed | **Yes** | `test_whitespace_only_billed_is_failed` |
+| Empty + zero reported tokens | **Yes** (not failed) | `test_empty_zero_output_tokens_is_not_this_failure` |
+| Missing usage | **Yes** (not failed) | `test_empty_missing_usage_is_not_this_failure` |
+| Tool-call-only billed | **Yes** (success) | `test_tool_call_only_billed_is_success` |
+| Legacy function_call | **Yes** (success) | `test_legacy_function_call_only_is_success` |
+| Refusal | **Yes** (success, checkpointed) | `test_refusal_is_success_and_checkpointed` |
+| Reasoning-only billed | **Yes** (failed) | `test_reasoning_only_billed_is_still_failed` |
+| Anthropic tool_use | **Yes** (success) | `test_anthropic_tool_use_only_is_success` |
+| Anthropic thinking-only billed | **Yes** (failed) | `test_anthropic_blank_billed_is_failed` |
+| Shadow on blank billed | **Yes** | `test_blank_billed_triggers_shadow_repair` |
+| Live OpenRouter, `max_tokens=80` | **Yes** | `scripts/live_blank_reply_proof.py`: 10 calls, **3** organic blanks (`ids 3,7,9`), all `failed=True`, **0** left as success, checkpoints=7, shadow recency dry-run `applied=False` ×3, attestation 6 entries `unresolved_not_applied=3` `applied=0`, `verify_attestation.py` exit 0 pinned |
+| Full suite | **Yes** | `python -m pytest tests/ -v --tb=short` → **234 passed, 1 skipped** |
+| Historic `~/.streamctx/sessions.db` | **Counted, not rewritten** | Exact empty-string + billed + success: **4** rows (session 1848, 2026-09-17, `openrouter/free`, 220 tokens). Do **not** use the 20,564 NULL `response_text` successes — that column was added later and not backfilled. Integration-proof DB: **7** empty-string billed successes from the pre-fix live run. |
+| Wrong-text vs session history | **Review signal, not failed** | See Layer 1/2 session-grounded fact review below. Still not `failed=True`. |
+| Empty + zero billed tokens | **Still open / not this case** | Left as success so mocks and no-ops do not false-fire. |
+| Audio-only / image-only assistants | **Still assumed** | Not extracted; would look blank if billed. |
+| OpenAI Responses API / non-`chat.completions` | **Not this intercept** | Only `Completions.create` and Anthropic `messages.create`. |
+
+**Verdict:** the observed blank-but-billed blind spot is **closed** on the chat-completions intercept for OpenAI-style and Anthropic-style clients. Tool-call-only and refusals are not misclassified. Non-empty wrong text is still `failed=False`; the follow-up pass adds a Layer 2 review signal for a narrow class of session-grounded contradictions.
+
+---
+
+# Layer 1/2 — Session-grounded fact review (not a hallucination detector)
+
+Date: 2026-09-18
+SDK parent: uncommitted on merged `main` after `98c7f03` (blank-reply intercept already in the tree).
+
+## Step 0 — What is actually detectable
+
+A fluent, well-formed reply that is *factually wrong* is a different problem from a blank reply. Blank is structural. Wrongness needs ground truth. The SDK only has the session.
+
+| Class | In scope? | Why |
+| --- | --- | --- |
+| Reply contradicts a stable ID already stored in this session (`ACME-9917` vs `ACME-1234`) | **Yes** | Ground truth is in `messages_json`. Reuses Layer 1 `_STABLE_ID_RE` (`compressor.py:37`). |
+| Reply contradicts a `$` amount already stored in this session (`$12.4` vs `$47.3`) | **Yes, with paraphrase guards** | Dollar arm of Layer 3 `_REPAIR_FACT_RE` (`repair.py:204-206`), plus commas. `$12.4` vs `$12,400,000` is treated as the same amount (×1e3/1e6/1e9). |
+| Reply cites a stable-ID family that never appeared | **No** | Presence/absence of a *new* family is not contradiction; assistants mint IDs. |
+| Reply is wrong about the world (legal advice, science, news) | **No** | Requires external ground truth the SDK does not have and must not pretend to have. |
+| Bare decimals, years, unprefixed numbers | **No** | Too noisy; would cry wolf. |
+
+This is **not** a general hallucination detector. Shipping one would be dishonest.
+
+## What already existed (audit)
+
+- Layer 1 compressor pins whole messages that match `_STABLE_ID_RE` / constraint language (`compressor.py:28-51`). Dollars are **not** pinned unless they sit in a high-value message.
+- Layer 2 compression scoring uses `_FACT_RE` (digits + stable IDs) on uncompressed vs compressed blobs (`attribution.py:73,183-192`).
+- Layer 3 `verify_fix` extracts `$` / decimals / 4+ digit runs / stable IDs (`repair.py:204-206,540-541`) and only runs on `failed=True` with empty `error_message`.
+- Until this pass, none of that ran on a **successful** reply. `_persist_success` still hardcodes `failed=False` (`tracker.py:905-938`).
+
+## Senior-bar results (must not cry wolf)
+
+Judged against `find_reply_contradictions` (`facts.py:175-248`) and the intercept hook (`tracker.py:799-801,884-903`). False positives on paraphrase/updates are as bad as misses.
+
+| Case | Verdict | What happened |
+| --- | --- | --- |
+| Early `ACME-9917` in a 24-filler-turn history, reply `ACME-1234` | **PASS** | Caught. GT is stored uncompressed history, not the compressed outbound window. |
+| `$12.4 million` restated as `12,400,000 dollars` (no `$`) | **PASS** | No finding. Unprefixed numbers are out of scope. |
+| `$12.4` vs `$12,400,000` | **PASS** | Scale-variant; no finding. |
+| `$12.4` vs `$12.40` | **PASS** | Equal after parse; no finding. |
+| `$12.4` vs `$47.3` | **PASS** | Contradiction. |
+| Recap "was ACME-9917, now ACME-4401" after a real reassignment | **PASS** | Contains GT; no finding. |
+| User "reassigned to ACME-4401", reply uses `ACME-4401` | **PASS** | Last non-question user/system assertion wins. |
+| Reply still uses `ACME-9917` after that update | **PASS** | Stale; flagged. |
+| User question "the ticket is ACME-1234, right?" | **PASS** | `?` does not update GT. Agreeing with the trap is a contradiction. |
+| Prior assistant hallucination does not become GT | **PASS** | Assistant role is ignored for ground truth. |
+| New family `GH-4411` while session is `ACME-*` | **PASS** | Not flagged. |
+| Omitting the fact entirely | **PASS** | Not completeness. |
+| `$` amount dropped by compression (first-sentence extract / budget trim), reply uses a different `$` | **PASS** | `missing_context`, not `contradiction`. The SDK dropped the fact on purpose. |
+| Wrong ID while compression still pinned the original | **PASS** | `contradiction` (`expected_in_compressed=True`). |
+
+False-positive rate on the paraphrase/update cases above is **zero** in this suite. The check is narrow enough to ship. If it were not, this pass would have stopped here.
+
+## What shipped
+
+A review signal, **not** `failed=True`:
+
+1. `src/streamctx/facts.py` — session-grounded extractor. Same-family IDs + `$` amounts. Latest non-question USER/SYSTEM value wins.
+2. After `_persist_success`, `LLMTracker._review_success_facts` calls `AttributionEngine.review_success_reply` (`tracker.py:799-801,884-903`, `attribution.py:508-598`).
+3. On a finding: row in `shadow_attribution_log` with `failure_kind=stable_fact_review`, `dominant_signal` `contradiction` or `missing_context`. Layer 4 `safe_append_evidence("attribution", …)` if a key is configured. Call row stays `failed=False`. Checkpoint still moves.
+4. Opt-out: `STREAMCTX_FACT_REVIEW=0`.
+5. Does **not** enter Layer 2's 0.5/0.3/0.2 failure ranking and does **not** start Layer 3 shadow repair (those still require `failed=True`).
+
+Lower confidence than a blank reply is the point. Blank is structural. This is a flagged-for-review signal.
+
+## Proof
+
+| Path | Proven? | How |
+| --- | --- | --- |
+| ID contradiction, long session, paraphrase, scale variant, update, question trap, compression drop | **Yes** | `tests/test_fact_contradiction.py` (20 cases) |
+| Intercept logs review and leaves `failed=False` | **Yes** | `test_intercept_logs_review_without_failing_the_call` |
+| Paraphrase / legitimate update do not log | **Yes** | `test_intercept_does_not_log_paraphrase`, `test_intercept_does_not_log_legitimate_update` |
+| Opt-out | **Yes** | `test_fact_review_opt_out` |
+| Live OpenRouter paraphrase `$12.4 million` → `$12,400,000` | **Yes** | `scripts/live_fact_contradiction_proof.py` session B: review_count=0 |
+| Live legitimate reassignment `ACME-9917` → `ACME-4401` | **Yes** | Session C: reply `ACME-4401`, review_count=0 |
+| Live sycophancy trap "it's ACME-1234, right?" | **Organic miss, honest** | Session A: model answered `ACME-9917` (correct). No review row. Turn 2 was blank-billed (`failed=True`) — blank-reply fix still holds. |
+| Labeled injected wrap, wrong ID, still `failed=False` | **Yes** | Same script: `contradiction stable_id: expected ACME-9917, reply used ACME-1234`, `failed=false` |
+| Full suite | **This pass** | `tests/test_fact_contradiction.py` 20 passed. Full `tests/`: **253 passed, 1 skipped**, plus 1 pre-existing flake `test_kill9_mid_write_fail_safe` (`unreadable_intent` vs `uncommitted_intent`) unrelated to this change. |
+
+## Explicit capability boundary
+
+Caught:
+
+- Same-family stable-ID swap against the latest non-question user/system assertion in stored (uncompressed) session history.
+- `$` amount swap that is not a 1e3/1e6/1e9 scale paraphrase of that assertion.
+- Same mismatch when compression dropped the fact from outbound context, labeled `missing_context` rather than `contradiction`.
+
+Deliberately not attempted:
+
+- General factual correctness against the world. The SDK has no external ground truth.
+- Completeness (omitting a known fact).
+- New ID families, bare numbers, years, cities, names, or unconstrained natural-language claims.
+- Automatic `failed=True` / Layer 3 repair on these rows. Confidence is lower than a blank reply; crying wolf on a billed success would be worse than missing some wrong text.
+
+A system that says it catches X and Y and does not attempt Z because Z needs ground truth it does not have is more trustworthy than one that implies a hallucination detector.
+
+**Verdict:** the narrow session-grounded check survived the senior-bar cases and is shipped as a Layer 2 review signal. The "said something wrong about the world" case remains out of scope on purpose.
+
 

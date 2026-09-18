@@ -184,21 +184,185 @@ def _cached_response_from_row(row: dict[str, Any]) -> Any:
     )
 
 
-def _response_text(response: Any, provider: str) -> str:
+def _choice_message(response: Any) -> Any:
+    """Return the first choice message (object or dict), or None."""
     try:
-        text = response.choices[0].message.content
-        if text:
-            return str(text)
+        choices = response.choices
+        if choices:
+            return choices[0].message
     except (AttributeError, IndexError, TypeError):
         pass
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        if not choices:
+            return None
+        first = choices[0]
+        if isinstance(first, dict):
+            return first.get("message")
+        return getattr(first, "message", None)
+    return None
+
+
+def _field(obj: Any, *names: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj and obj[name] is not None:
+                return obj[name]
+        return None
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            if value is not None:
+                return value
+    return None
+
+
+def _seq_nonempty(value: Any) -> bool:
+    if not value:
+        return False
+    try:
+        return len(value) > 0
+    except TypeError:
+        return True
+
+
+def _block_type(block: Any) -> str:
+    if isinstance(block, dict):
+        return str(block.get("type") or "")
+    return str(getattr(block, "type", "") or "")
+
+
+def _visible_text_blocks(content: Any) -> str:
+    """User-visible text only. Thinking/tool_use/reasoning blocks are ignored."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    blocks = content if isinstance(content, list) else [content]
+    parts: list[str] = []
+    for block in blocks:
+        btype = _block_type(block)
+        if btype in {"thinking", "tool_use", "tool_result", "reasoning", "redacted_thinking"}:
+            continue
+        if btype in {"text", ""} or btype == "output_text":
+            if isinstance(block, dict):
+                text = block.get("text")
+            else:
+                text = getattr(block, "text", None)
+            if text:
+                parts.append(str(text))
+            elif btype == "" and isinstance(block, str):
+                parts.append(block)
+    return "\n".join(parts)
+
+
+def _response_text(response: Any, provider: str) -> str:
+    """User-visible assistant text. Not reasoning, not tool payloads.
+
+    OpenAI/OpenRouter: ``choices[0].message.content``, then ``refusal``.
+    Anthropic: ``type=text`` blocks only. Dict fallbacks: content / text.
+    """
+    message = _choice_message(response)
+    if message is not None:
+        content = _field(message, "content")
+        text = _visible_text_blocks(content) if not isinstance(content, str) else (content or "")
+        if not str(text).strip():
+            text = _field(message, "refusal") or ""
+        if str(text).strip():
+            return str(text)
     if provider == "anthropic":
         try:
-            return _extract_text(getattr(response, "content", ""))
+            text = _visible_text_blocks(getattr(response, "content", None))
+            if str(text).strip():
+                return str(text)
         except (AttributeError, TypeError):
             pass
     if isinstance(response, dict):
-        return str(response.get("content") or response.get("text") or "")
+        text = response.get("content") or response.get("text") or ""
+        if isinstance(text, str) and text.strip():
+            return text
+        nested = _visible_text_blocks(text)
+        if str(nested).strip():
+            return str(nested)
     return ""
+
+
+def _has_tool_payload(response: Any, provider: str) -> bool:
+    """True when the model returned a tool/function call rather than text."""
+    message = _choice_message(response)
+    if message is not None:
+        if _seq_nonempty(_field(message, "tool_calls")):
+            return True
+        function_call = _field(message, "function_call")
+        if function_call:
+            name = _field(function_call, "name")
+            if name:
+                return True
+            if isinstance(function_call, dict) and function_call.get("name"):
+                return True
+        finish = None
+        try:
+            finish = response.choices[0].finish_reason
+        except (AttributeError, IndexError, TypeError):
+            if isinstance(response, dict):
+                choices = response.get("choices") or []
+                if choices and isinstance(choices[0], dict):
+                    finish = choices[0].get("finish_reason")
+        if str(finish or "") in {"tool_calls", "function_call", "tool_use"}:
+            return True
+    content = None
+    if provider == "anthropic":
+        content = getattr(response, "content", None)
+    if content is None and isinstance(response, dict):
+        content = response.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if _block_type(block) == "tool_use":
+                return True
+    return False
+
+
+def _provider_reported_output_tokens(response: Any) -> int:
+    """Tokens the provider billed, not the len//4 estimate fallback."""
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        raw = getattr(usage, "completion_tokens", None)
+        if raw is None:
+            raw = getattr(usage, "output_tokens", None)
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(response, dict) and isinstance(response.get("usage"), dict):
+        u = response["usage"]
+        raw = u.get("completion_tokens")
+        if raw is None:
+            raw = u.get("output_tokens")
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _is_blank_billed_reply(
+    response: Any,
+    provider: str,
+    reply_text: str,
+) -> bool:
+    """True when the model billed output tokens but said nothing usable.
+
+    Tool/function calls with no text are valid. Refusals are visible text.
+    Empty content with *zero reported* output tokens is not this case
+    (stubs, no-ops, missing usage).
+    """
+    if _has_tool_payload(response, provider):
+        return False
+    if str(reply_text or "").strip():
+        return False
+    return _provider_reported_output_tokens(response) > 0
 
 
 def _hash_text(text: str) -> str:
@@ -582,15 +746,39 @@ class LLMTracker:
             messages = _normalize_messages(kwargs.get("messages")) or recovery_msgs
             fingerprint = _message_fingerprint(messages)
 
-        self.healer.record_success(messages, response)
         reply = _response_text(response, provider)
+        input_tokens, output_tokens = self._extract_usage(
+            response, provider, messages, kwargs
+        )
+
+        if _is_blank_billed_reply(response, provider, reply):
+            # Provider returned 200 and billed output tokens but produced
+            # no user-visible text and no tool call. This is a content
+            # failure: do not move the resume checkpoint, do not treat
+            # it as healer success. error_message stays None so Layer 3
+            # shadow-repair (empty-error content_error) still fires.
+            self.healer.record_failure()
+            self._persist_failure(
+                provider,
+                model,
+                messages,
+                fingerprint,
+                error_message=None,
+                healed=False,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost=pricing.estimate_cost(model, input_tokens, output_tokens),
+                reused_tokens=context_savings_tokens,
+                waste_category=waste,
+                response_text=reply,
+            )
+            return response
+
+        self.healer.record_success(messages, response)
         conversation = list(messages)
         if reply:
             conversation.append({"role": "assistant", "content": reply})
 
-        input_tokens, output_tokens = self._extract_usage(
-            response, provider, messages, kwargs
-        )
         cost = pricing.estimate_cost(model, input_tokens, output_tokens)
 
         record = CallRecord(
@@ -608,7 +796,9 @@ class LLMTracker:
             message_fingerprint=fingerprint,
             response_text=reply,
         )
-        self._persist_success(record, conversation)
+        call_id = self._persist_success(record, conversation)
+        if call_id and reply and str(reply).strip():
+            self._review_success_facts(int(call_id))
 
         with self.state._lock:
             self.state.call_count += 1
@@ -658,43 +848,76 @@ class LLMTracker:
         fingerprint: str,
         error_message: Optional[str],
         healed: bool,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost: float = 0.0,
+        reused_tokens: int = 0,
+        waste_category: Optional[str] = None,
+        response_text: Optional[str] = None,
     ) -> None:
-        """Record a failed call without moving the resume checkpoint."""
+        """Record a failed call without moving the resume checkpoint.
+
+        Exception failures keep the historical zero-token shape. Blank
+        billed replies pass through the real usage so the row still
+        shows that output tokens were charged.
+        """
         with self.state._lock:
             self.state.call_count += 1
         self._persist(
             CallRecord(
                 provider=provider,
                 model=model,
-                input_tokens=0,
-                output_tokens=0,
-                cost=0.0,
-                reused_tokens=0,
-                waste_category=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost=cost,
+                reused_tokens=reused_tokens,
+                waste_category=waste_category,
                 messages=messages,
                 failed=True,
                 healed=healed,
                 error_message=error_message,
                 message_fingerprint=fingerprint,
+                response_text=response_text,
             )
         )
+
+    def _review_success_facts(self, call_id: int) -> None:
+        """Layer 2 review signal for session-grounded fact contradictions.
+
+        Never flips ``failed`` and never raises into the caller.
+        """
+        try:
+            from .facts import fact_review_enabled
+
+            if not fact_review_enabled():
+                return
+            session_id = self.state.session_id
+            if session_id is None:
+                return
+            from .attribution import AttributionEngine
+
+            AttributionEngine(storage=self.state.storage).review_success_reply(
+                int(session_id), int(call_id)
+            )
+        except Exception:
+            return
 
     def _persist_success(
         self,
         record: CallRecord,
         conversation: list[dict[str, str]],
-    ) -> None:
+    ) -> Optional[int]:
         with self.state._lock:
             self.state.step_counter += 1
             self.state._last_messages = list(conversation)
             step = self.state.step_counter
             session_id = self.state.session_id
         if session_id is None:
-            return
+            return None
         persist_step = getattr(self.state.storage, "persist_step", None)
         try:
             if persist_step is not None:
-                persist_step(
+                return persist_step(
                     session_id=session_id,
                     provider=record.provider,
                     model=record.model,
@@ -713,19 +936,19 @@ class LLMTracker:
                     response_text=record.response_text,
                     checkpoint_valid=True,
                 )
-            else:
-                self._persist(record)
-                self.state.storage.save_checkpoint(session_id, step, conversation)
+            call_id = self._persist(record)
+            self.state.storage.save_checkpoint(session_id, step, conversation)
+            return call_id
         except Exception:
             # Provider already succeeded — do not drop the response on a
             # storage failure. In-memory snapshot still lets the process resume.
-            return
+            return None
 
-    def _persist(self, record: CallRecord) -> None:
+    def _persist(self, record: CallRecord) -> Optional[int]:
         if self.state.session_id is None:
-            return
+            return None
         try:
-            self.state.storage.record_call(
+            return self.state.storage.record_call(
                 session_id=self.state.session_id,
                 provider=record.provider,
                 model=record.model,
@@ -742,22 +965,25 @@ class LLMTracker:
                 response_text=record.response_text,
             )
         except TypeError:
-            self.state.storage.record_call(
-                session_id=self.state.session_id,
-                provider=record.provider,
-                model=record.model,
-                input_tokens=record.input_tokens,
-                output_tokens=record.output_tokens,
-                cost=record.cost,
-                reused_tokens=record.reused_tokens,
-                waste_category=record.waste_category,
-                messages=record.messages,
-                failed=record.failed,
-                healed=record.healed,
-                error_message=record.error_message,
-            )
+            try:
+                return self.state.storage.record_call(
+                    session_id=self.state.session_id,
+                    provider=record.provider,
+                    model=record.model,
+                    input_tokens=record.input_tokens,
+                    output_tokens=record.output_tokens,
+                    cost=record.cost,
+                    reused_tokens=record.reused_tokens,
+                    waste_category=record.waste_category,
+                    messages=record.messages,
+                    failed=record.failed,
+                    healed=record.healed,
+                    error_message=record.error_message,
+                )
+            except Exception:
+                return None
         except Exception:
-            return
+            return None
 
     def _extract_usage(
         self,

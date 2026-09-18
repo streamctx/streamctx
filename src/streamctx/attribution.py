@@ -30,6 +30,7 @@ gated on a paid tier, license check, or hosted-only flag.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
@@ -303,16 +304,20 @@ def _abstain(
     )
 
 
-def _row_to_snapshot(row: dict[str, Any]) -> CallSnapshot:
-    import json
-
-    raw_messages = row.get("messages_json")
+def _parse_stored_messages(raw_messages: Any) -> list[dict[str, Any]]:
+    if isinstance(raw_messages, list):
+        return [m for m in raw_messages if isinstance(m, dict)]
     try:
         messages = json.loads(raw_messages) if raw_messages else []
     except (TypeError, ValueError):
         messages = []
     if not isinstance(messages, list):
-        messages = []
+        return []
+    return [m for m in messages if isinstance(m, dict)]
+
+
+def _row_to_snapshot(row: dict[str, Any]) -> CallSnapshot:
+    messages = _parse_stored_messages(row.get("messages_json"))
 
     return CallSnapshot(
         id=int(row["id"]),
@@ -498,6 +503,98 @@ class AttributionEngine:
             if call.failed:
                 results.append(self.attribute_failure(session_id, call.id, calls=calls))
         return results
+
+    def review_success_reply(
+        self,
+        session_id: int,
+        call_id: int,
+    ) -> Optional[AttributionResult]:
+        """Flag a successful reply that contradicts stored session facts.
+
+        This is a review signal, not a failure. ``failed`` on the call row
+        is left unchanged. Findings reuse Layer 1's stable-ID regex and
+        Layer 3's dollar-amount tokens; they do not judge real-world
+        correctness. No row is written when the reply is clean.
+        """
+        from .facts import (
+            FAILURE_KIND,
+            KIND_CONTRADICTION,
+            KIND_MISSING_CONTEXT,
+            compressed_view,
+            fact_review_enabled,
+            find_reply_contradictions,
+            format_findings,
+        )
+
+        if not fact_review_enabled():
+            return None
+
+        rows = self.storage.get_calls_for_session(session_id)
+        current = next((r for r in rows if int(r["id"]) == int(call_id)), None)
+        if current is None:
+            return None
+        reply = str(current.get("response_text") or "")
+        if not reply.strip():
+            return None
+
+        history: list[dict[str, Any]] = []
+        for row in rows:
+            if int(row["id"]) > int(call_id):
+                break
+            for msg in _parse_stored_messages(row.get("messages_json")):
+                item = dict(msg)
+                item["call_id"] = int(row["id"])
+                history.append(item)
+
+        request = _parse_stored_messages(current.get("messages_json"))
+        outbound = compressed_view(request) if request else None
+        findings = find_reply_contradictions(
+            history, reply, compressed_outbound=outbound
+        )
+        if not findings:
+            return None
+
+        has_contradiction = any(f.kind == KIND_CONTRADICTION for f in findings)
+        dominant = KIND_CONTRADICTION if has_contradiction else KIND_MISSING_CONTEXT
+        if has_contradiction and any(f.fact_type == "stable_id" for f in findings):
+            confidence = 0.85
+        elif has_contradiction:
+            confidence = 0.70
+        else:
+            confidence = 0.55
+
+        source_ids = [f.source_call_id for f in findings if f.source_call_id]
+        root_cause = source_ids[-1] if source_ids else int(call_id)
+        breakdown = {
+            KIND_CONTRADICTION: 1.0 if has_contradiction else 0.0,
+            KIND_MISSING_CONTEXT: 0.0 if has_contradiction else 1.0,
+        }
+        result = AttributionResult(
+            session_id=int(session_id),
+            failed_call_id=int(call_id),
+            root_cause_call_id=int(root_cause),
+            root_cause_step_offset=None,
+            confidence=confidence,
+            reason=format_findings(findings),
+            signal_breakdown=breakdown,
+        )
+        try:
+            insert = getattr(self.storage, "insert_shadow_attribution_log", None)
+            if insert is not None:
+                insert(
+                    session_id=int(session_id),
+                    failed_call_id=int(call_id),
+                    dominant_signal=dominant,
+                    confidence=confidence,
+                    root_cause_call_id=int(root_cause),
+                    reason=result.reason,
+                    error_message=None,
+                    failure_kind=FAILURE_KIND,
+                    signal_breakdown=breakdown,
+                )
+        except Exception:
+            pass
+        return self._finish(result)
     
 
     @staticmethod

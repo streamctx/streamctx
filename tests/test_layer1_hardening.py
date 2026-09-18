@@ -440,3 +440,254 @@ def test_concurrent_persist_step_50_workers(tmp_path):
     n_ckpts = conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
     conn.close()
     assert n_calls == n_ckpts == 50 * 20
+
+
+# ---------------------------------------------------------------------------
+# Blank-but-billed replies (integration-proof defect)
+# ---------------------------------------------------------------------------
+
+def _blank_billed(*, content="", tokens=220, **message_extra):
+    message = SimpleNamespace(
+        content=content,
+        tool_calls=message_extra.get("tool_calls"),
+        function_call=message_extra.get("function_call"),
+        refusal=message_extra.get("refusal"),
+        reasoning=message_extra.get("reasoning"),
+    )
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=message,
+                finish_reason=message_extra.get("finish_reason", "stop"),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=tokens),
+    )
+
+
+class _FakeAnthropicMessages:
+    def __init__(self, on_create):
+        self._on_create = on_create
+
+    def create(self, **kwargs):
+        return self._on_create(**kwargs)
+
+
+class _FakeAnthropic:
+    def __init__(self, on_create):
+        self.messages = _FakeAnthropicMessages(on_create)
+
+
+def _run_one(tmp_path, agent, on_create, *, anthropic=False, messages=None):
+    tracker = _tracker(tmp_path, agent)
+    tracker.start()
+    client = tracker.wrap(
+        _FakeAnthropic(on_create) if anthropic else _FakeClient(on_create)
+    )
+    msgs = messages or [{"role": "user", "content": "hello"}]
+    if anthropic:
+        result = client.messages.create(model="claude", messages=msgs)
+    else:
+        result = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
+    sid = tracker.get_session_id()
+    storage = tracker.state.storage
+    tracker.stop()
+    return result, storage, sid
+
+
+def test_blank_billed_reply_is_failed_and_does_not_move_checkpoint(tmp_path):
+    result, storage, sid = _run_one(
+        tmp_path,
+        "blank-billed",
+        lambda **kw: _blank_billed(content="", tokens=220),
+    )
+    assert result.choices[0].message.content == ""
+    rows = storage.get_calls_for_session(sid)
+    assert len(rows) == 1
+    assert rows[0]["failed"] in (1, True)
+    assert not (rows[0].get("error_message") or "").strip()
+    assert int(rows[0]["output_tokens"]) == 220
+    ckpts = storage._write_conn.execute(
+        "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?", (sid,)
+    ).fetchone()[0]
+    assert ckpts == 0
+    resumed = storage.get_latest_valid_checkpoint(sid)
+    assert resumed is None
+
+
+def test_blank_none_content_billed_is_failed(tmp_path):
+    _, storage, sid = _run_one(
+        tmp_path,
+        "blank-none",
+        lambda **kw: _blank_billed(content=None, tokens=80),
+    )
+    row = storage.get_calls_for_session(sid)[0]
+    assert row["failed"] in (1, True)
+    assert int(row["output_tokens"]) == 80
+
+
+def test_whitespace_only_billed_is_failed(tmp_path):
+    _, storage, sid = _run_one(
+        tmp_path,
+        "blank-ws",
+        lambda **kw: _blank_billed(content="  \n\t", tokens=40),
+    )
+    assert storage.get_calls_for_session(sid)[0]["failed"] in (1, True)
+
+
+def test_empty_zero_output_tokens_is_not_this_failure(tmp_path):
+    _, storage, sid = _run_one(
+        tmp_path,
+        "empty-zero",
+        lambda **kw: _blank_billed(content="", tokens=0),
+    )
+    row = storage.get_calls_for_session(sid)[0]
+    assert row["failed"] in (0, False)
+    ckpts = storage._write_conn.execute(
+        "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?", (sid,)
+    ).fetchone()[0]
+    assert ckpts == 1
+
+
+def test_empty_missing_usage_is_not_this_failure(tmp_path):
+    def on_create(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=""))]
+        )
+
+    _, storage, sid = _run_one(tmp_path, "empty-nouse", on_create)
+    row = storage.get_calls_for_session(sid)[0]
+    assert row["failed"] in (0, False)
+
+
+def test_tool_call_only_billed_is_success(tmp_path):
+    tool = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="lookup_table", arguments="{}"),
+    )
+
+    def on_create(**kwargs):
+        return _blank_billed(
+            content=None,
+            tokens=64,
+            tool_calls=[tool],
+            finish_reason="tool_calls",
+        )
+
+    _, storage, sid = _run_one(tmp_path, "tool-only", on_create)
+    row = storage.get_calls_for_session(sid)[0]
+    assert row["failed"] in (0, False)
+    ckpts = storage._write_conn.execute(
+        "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?", (sid,)
+    ).fetchone()[0]
+    assert ckpts == 1
+
+
+def test_legacy_function_call_only_is_success(tmp_path):
+    def on_create(**kwargs):
+        return _blank_billed(
+            content="",
+            tokens=20,
+            function_call=SimpleNamespace(name="lookup", arguments="{}"),
+            finish_reason="function_call",
+        )
+
+    _, storage, sid = _run_one(tmp_path, "fn-call", on_create)
+    assert storage.get_calls_for_session(sid)[0]["failed"] in (0, False)
+
+
+def test_refusal_is_success_and_checkpointed(tmp_path):
+    def on_create(**kwargs):
+        return _blank_billed(
+            content=None,
+            tokens=18,
+            refusal="I can't help with that request.",
+        )
+
+    result, storage, sid = _run_one(tmp_path, "refusal", on_create)
+    row = storage.get_calls_for_session(sid)[0]
+    assert row["failed"] in (0, False)
+    assert "can't help" in (row.get("response_text") or "")
+    ckpt = storage.get_latest_valid_checkpoint(sid)
+    assert ckpt is not None
+    blob = json.dumps(ckpt["messages"])
+    assert "can't help" in blob
+
+
+def test_reasoning_only_billed_is_still_failed(tmp_path):
+    """Hidden reasoning is not user-visible content. Same as the live miss."""
+
+    def on_create(**kwargs):
+        return _blank_billed(
+            content="",
+            tokens=220,
+            reasoning="Let me unpack the user's question internally...",
+        )
+
+    _, storage, sid = _run_one(tmp_path, "reason-only", on_create)
+    assert storage.get_calls_for_session(sid)[0]["failed"] in (1, True)
+
+
+def test_anthropic_tool_use_only_is_success(tmp_path):
+    def on_create(**kwargs):
+        return SimpleNamespace(
+            content=[
+                SimpleNamespace(type="tool_use", id="t1", name="lookup", input={"q": "x"})
+            ],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=55),
+        )
+
+    _, storage, sid = _run_one(tmp_path, "anth-tool", on_create, anthropic=True)
+    assert storage.get_calls_for_session(sid)[0]["failed"] in (0, False)
+
+
+def test_anthropic_blank_billed_is_failed(tmp_path):
+    def on_create(**kwargs):
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="thinking", thinking="hmm")],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=90),
+        )
+
+    _, storage, sid = _run_one(tmp_path, "anth-blank", on_create, anthropic=True)
+    row = storage.get_calls_for_session(sid)[0]
+    assert row["failed"] in (1, True)
+    assert int(row["output_tokens"]) == 90
+
+
+def test_blank_billed_does_not_shadow_normal_text(tmp_path):
+    _, storage, sid = _run_one(
+        tmp_path,
+        "normal",
+        lambda **kw: _fake_response("the revenue was $12.4 million"),
+    )
+    row = storage.get_calls_for_session(sid)[0]
+    assert row["failed"] in (0, False)
+    assert "12.4" in (row.get("response_text") or "")
+
+
+def test_blank_billed_triggers_shadow_repair(tmp_path, monkeypatch):
+    monkeypatch.setenv("STREAMCTX_SHADOW_REPAIR", "1")
+    monkeypatch.setenv("STREAMCTX_SHADOW_REPAIR_SYNC", "1")
+    tracker = _tracker(tmp_path, "blank-shadow")
+    tracker.start()
+    client = tracker.wrap(
+        _FakeClient(lambda **kw: _blank_billed(content="", tokens=220))
+    )
+    client.chat.completions.create(
+        model="x",
+        messages=[
+            {"role": "user", "content": "Ticket ACME-9917. Budget $12.4 million."}
+        ],
+    )
+    sid = tracker.get_session_id()
+    storage = tracker.state.storage
+    tracker.stop()
+
+    rows = storage.get_calls_for_session(sid)
+    assert rows[0]["failed"] in (1, True)
+    shadow = storage.get_shadow_repair_log()
+    assert len(shadow) == 1
+    assert int(shadow[0]["session_id"]) == int(sid)
+    assert shadow[0]["applied"] in (0, False, None)
+    assert shadow[0]["dry_run"] in (1, True)
