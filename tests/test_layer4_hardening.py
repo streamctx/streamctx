@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from streamctx.attribution import AttributionEngine
 from streamctx.evidence import (
     NO_DELETE_PAYLOAD_TRIGGER,
     NO_DELETE_TRIGGER,
@@ -446,6 +447,31 @@ def test_silent_omission_is_detectable_against_shadow_log(tmp_path, ledger, monk
     recon = ledger.reconcile_shadow_log(storage, session_id=sid)
     assert recon["complete"] is False
     assert (int(sid), int(fid)) in recon["missing_from_ledger"]
+
+
+def test_reconcile_attribution_log_detects_computed_but_unlogged(
+    tmp_path, ledger, monkeypatch
+):
+    monkeypatch.delenv("STREAMCTX_EVIDENCE_PRIVATE_KEY", raising=False)
+    storage = SessionStorage(db_path=tmp_path / "sessions.db")
+    sid, fid, _fact = _seed_compression_session(storage)
+    AttributionEngine(storage=storage, evidence=None).attribute_failure(sid, fid)
+    recon = ledger.reconcile_attribution_log(storage, session_id=sid)
+    assert recon["complete"] is False
+    assert (int(sid), int(fid)) in recon["missing_from_ledger"]
+
+
+def test_reconcile_attribution_log_matches_when_persisted(
+    tmp_path, ledger, monkeypatch
+):
+    monkeypatch.delenv("STREAMCTX_EVIDENCE_PRIVATE_KEY", raising=False)
+    storage = SessionStorage(db_path=tmp_path / "sessions.db")
+    sid, fid, _fact = _seed_compression_session(storage)
+    AttributionEngine(storage=storage, evidence=ledger).attribute_failure(sid, fid)
+    recon = ledger.reconcile_attribution_log(storage, session_id=sid)
+    assert recon["complete"] is True
+    assert recon["matched"] >= 1
+    assert (int(sid), int(fid)) not in recon["missing_from_ledger"]
 
 
 def test_torn_intent_file_is_unreadable(tmp_path, ledger):

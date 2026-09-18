@@ -1131,9 +1131,39 @@ class EvidenceLedger:
         """Compare repair ledger rows to ``shadow_repair_log``.
 
         Detects a shadow attempt that was never written to the ledger.
-        Never-attempted Layer 2 attributions have no independent table
-        and remain undetectable by design.
+        Attributions that were never computed remain undetectable.
         """
+        return self._reconcile_independent_log(
+            storage,
+            session_id=session_id,
+            record_type="repair",
+            get_log="get_shadow_repair_log",
+        )
+
+    def reconcile_attribution_log(
+        self, storage: Any, session_id: Optional[int] = None
+    ) -> dict[str, Any]:
+        """Compare attribution ledger rows to ``shadow_attribution_log``.
+
+        Detects an attribution that was computed (and written to the
+        independent log) but never persisted to the evidence ledger.
+        An attribution that was never computed at all is still invisible
+        — same completeness limit as Layer 3 reconciliation.
+        """
+        return self._reconcile_independent_log(
+            storage,
+            session_id=session_id,
+            record_type="attribution",
+            get_log="get_shadow_attribution_log",
+        )
+
+    def _reconcile_independent_log(
+        self,
+        storage: Any,
+        session_id: Optional[int],
+        record_type: str,
+        get_log: str,
+    ) -> dict[str, Any]:
         with self._write_lock:
             conn = self._connect()
             params: tuple[Any, ...] = ()
@@ -1141,18 +1171,20 @@ class EvidenceLedger:
                 SELECT e.entry_id, e.record_ref_id, p.session_id
                 FROM evidence_ledger e
                 JOIN evidence_payloads p ON p.entry_id = e.entry_id
-                WHERE e.record_type = 'repair'
+                WHERE e.record_type = ?
             """
+            params = (record_type,)
             if session_id is not None:
                 sql += " AND p.session_id = ?"
-                params = (int(session_id),)
+                params = (record_type, int(session_id))
             evidence_pairs = {
                 (int(row["session_id"]), int(row["record_ref_id"]))
                 for row in conn.execute(sql, params).fetchall()
                 if row["session_id"] is not None
             }
 
-        logs = storage.get_shadow_repair_log()
+        getter = getattr(storage, get_log, None)
+        logs = getter() if getter is not None else []
         shadow_pairs = set()
         for row in logs:
             sid = int(row["session_id"])

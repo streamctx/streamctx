@@ -128,6 +128,7 @@ class AttributionResult:
     confidence: float  # 0.0-1.0, the combined weighted score, normalized
     reason: str
     signal_breakdown: dict[str, float]
+    failure_kind: Optional[str] = None
 
 
 def _safe_div(numerator: float, denominator: float) -> float:
@@ -355,8 +356,32 @@ class AttributionEngine:
         self.evidence = evidence
 
     def _finish(self, result: AttributionResult) -> AttributionResult:
-        """Best-effort Layer 4 attestation; never breaks attribution."""
+        """Best-effort independent log + Layer 4 attestation; never breaks attribution."""
         from .evidence import safe_append_evidence
+
+        try:
+            insert = getattr(self.storage, "insert_shadow_attribution_log", None)
+            if insert is not None:
+                breakdown = result.signal_breakdown or {}
+                keys = [k for k in breakdown if k != "weighted_total"]
+                dominant = (
+                    max(keys, key=lambda k: float(breakdown.get(k) or 0.0))
+                    if keys
+                    else None
+                )
+                insert(
+                    session_id=int(result.session_id),
+                    failed_call_id=int(result.failed_call_id),
+                    dominant_signal=dominant,
+                    confidence=float(result.confidence),
+                    root_cause_call_id=result.root_cause_call_id,
+                    reason=result.reason,
+                    error_message=None,
+                    failure_kind=result.failure_kind or "attribution",
+                    signal_breakdown=breakdown,
+                )
+        except Exception:
+            pass
 
         safe_append_evidence(
             "attribution",
@@ -554,7 +579,6 @@ class AttributionEngine:
             return None
 
         has_contradiction = any(f.kind == KIND_CONTRADICTION for f in findings)
-        dominant = KIND_CONTRADICTION if has_contradiction else KIND_MISSING_CONTEXT
         if has_contradiction and any(f.fact_type == "stable_id" for f in findings):
             confidence = 0.85
         elif has_contradiction:
@@ -576,23 +600,8 @@ class AttributionEngine:
             confidence=confidence,
             reason=format_findings(findings),
             signal_breakdown=breakdown,
+            failure_kind=FAILURE_KIND,
         )
-        try:
-            insert = getattr(self.storage, "insert_shadow_attribution_log", None)
-            if insert is not None:
-                insert(
-                    session_id=int(session_id),
-                    failed_call_id=int(call_id),
-                    dominant_signal=dominant,
-                    confidence=confidence,
-                    root_cause_call_id=int(root_cause),
-                    reason=result.reason,
-                    error_message=None,
-                    failure_kind=FAILURE_KIND,
-                    signal_breakdown=breakdown,
-                )
-        except Exception:
-            pass
         return self._finish(result)
     
 
