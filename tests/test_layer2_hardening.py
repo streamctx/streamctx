@@ -503,3 +503,19 @@ def test_concurrent_attribution_50_workers_no_contamination(tmp_path):
         assert a.confidence == b.confidence
         assert a.root_cause_call_id == b.root_cause_call_id
         assert a.signal_breakdown == b.signal_breakdown
+
+
+def test_attribution_module_does_not_import_repair():
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "streamctx" / "attribution.py"
+    text = src.read_text(encoding="utf-8")
+    assert "from .repair import" not in text
+    assert "from streamctx.repair" not in text
+
+
+def test_classify_failure_shared_object():
+    from streamctx.failure import classify_failure as from_failure
+    from streamctx.repair import classify_failure as from_repair
+
+    assert from_failure is from_repair

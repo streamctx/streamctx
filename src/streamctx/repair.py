@@ -7,8 +7,10 @@ original failure condition is gone.
 
 Layer 3 is MIT-licensed core SDK logic. Nothing in this module is gated
 on a paid tier, license check, or hosted-only flag. ``classify_failure()``
-keeps its binary ``infra_error`` / ``content_error`` contract so Layer 2's
-``is_non_content_failure()`` wrapper is not silently broken.
+lives in ``failure.py`` (below Layer 2 and Layer 3) and is re-exported
+here so existing ``from streamctx.repair import classify_failure``
+imports keep working. The binary ``infra_error`` / ``content_error``
+contract is unchanged.
 
 ``verify_fix()`` is counterfactual: it never writes checkpoints or call
 rows. A live session is not mutated, even when ``resolved=True``. Shadow
@@ -61,44 +63,12 @@ from typing import Any, Callable, Optional
 
 from .attribution import AttributionEngine, AttributionResult, DEFAULT_LOOKBACK
 from .compressor import _message_text, compress_messages
+from .failure import classify_failure
 from .replay import CounterfactualReplayer, ReplayResult
 from .storage import get_storage
 
 # Dominant attribution signals we know how to turn into a fix.
 _SIGNAL_KEYS = ("drift", "compression", "recency")
-
-# Context injection cannot repair these — they are API/config failures.
-_INFRA_PATTERNS = (
-    r"\b401\b",
-    r"\b403\b",
-    r"\b404\b",
-    r"\b429\b",
-    r"\b502\b",
-    r"\b503\b",
-    r"error code:\s*400",
-    r"status(?:\s+code)?:\s*400",
-    r"unauthorized",
-    r"forbidden",
-    r"invalid api key",
-    r"authentication",
-    r"auth(?:entication)? fail",
-    r"rate[- ]?limit",
-    r"too many requests",
-    r"timeout",
-    r"timed out",
-    r"connection (?:refused|reset|error|aborted|timed)",
-    r"network (?:error|unreachable|timeout)",
-    r"malformed request",
-    r"invalid request",
-    r"bad request",
-    r"invalid model",
-    r"model[_ ]not[_ ]found",
-    r"is not a valid model",
-    r"model .+ (?:does not exist|not found|not available)",
-    r"does-not-exist",
-)
-
-_INFRA_RE = re.compile("|".join(_INFRA_PATTERNS), re.IGNORECASE)
 
 INFRA_NOT_REPAIRABLE = (
     "Not repairable via context injection — root cause is an "
@@ -125,29 +95,6 @@ _UNCERTAIN_REPLY_RE = re.compile(
     r"does(?:n'?t| not) specify",
     re.IGNORECASE,
 )
-
-
-def classify_failure(error_message: Optional[str]) -> str:
-    """Classify a failed call as ``infra_error`` or ``content_error``.
-
-    ``infra_error``
-        API/config failures that context injection cannot fix:
-        invalid model IDs, auth (401/403), rate limits (429),
-        network timeouts, malformed requests.
-
-    ``content_error``
-        The model responded (or would have) but the result was
-        low-quality, incomplete, hallucinated, or drifted — including
-        calls with no ``error_message`` but a flagged bad response.
-    """
-    if error_message is None:
-        return "content_error"
-    text = str(error_message).strip()
-    if not text:
-        return "content_error"
-    if _INFRA_RE.search(text):
-        return "infra_error"
-    return "content_error"
 
 
 def is_unfixable_content_failure(messages: list[dict[str, Any]]) -> bool:

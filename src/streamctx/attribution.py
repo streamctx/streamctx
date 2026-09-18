@@ -36,6 +36,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from .compressor import _message_text, _total_tokens, compress_messages
+from .failure import classify_failure
 from .storage import get_storage
 
 # --- Tunable weights for the v1 heuristic (see design doc) ---
@@ -73,8 +74,8 @@ _TERM_RE = re.compile(
 # dropped by extractive summary are not a cause; dropped numbers/IDs are.
 _FACT_RE = re.compile(r"\d+(?:\.\d+)?|[A-Z]{2,}[-_][A-Z0-9]{2,}")
 
-# Extra non-content needles beyond Layer 3 classify_failure() (401/429/
-# invalid model/timeout/…).  Kept here so repair.classify_failure() can
+# Extra non-content needles beyond classify_failure() (401/429/
+# invalid model/timeout/…).  Kept here so classify_failure() can
 # still treat "simulated failure" as a content_error placeholder in
 # Layer 3 tests, while attribution refuses to blame a heuristic for it.
 _NON_CONTENT_EXTRA_RE = re.compile(
@@ -270,12 +271,10 @@ def _recency_score(offset: int, lookback: int) -> float:
 def is_non_content_failure(error_message: Optional[str]) -> bool:
     """True for infra / SDK / load-test errors that are not content quality.
 
-    Reuses Layer 3 ``classify_failure()`` for API/config patterns, then
-    adds recursion-depth, simulated-failure, and SDK-signature needles
-    that classify_failure() still treats as content_error.
+    Reuses ``classify_failure()`` for API/config patterns, then adds
+    recursion-depth, simulated-failure, and SDK-signature needles that
+    classify_failure() still treats as content_error.
     """
-    from .repair import classify_failure
-
     if classify_failure(error_message) == "infra_error":
         return True
     if error_message is None:

@@ -43,7 +43,7 @@ def _env_flag(name: str, default: str = "1") -> bool:
 
 def should_shadow_repair(error_message: Optional[str]) -> bool:
     """True for content-quality failures with no exception text."""
-    from .repair import classify_failure
+    from .failure import classify_failure
 
     if classify_failure(error_message) != "content_error":
         return False
