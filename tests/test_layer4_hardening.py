@@ -448,6 +448,15 @@ def test_silent_omission_is_detectable_against_shadow_log(tmp_path, ledger, monk
     assert (int(sid), int(fid)) in recon["missing_from_ledger"]
 
 
+def test_torn_intent_file_is_unreadable(tmp_path, ledger):
+    ledger.append_evidence("attribution", 1, {"session_id": 1, "ok": True})
+    intent = Path(str(ledger.db_path) + ".intent")
+    intent.write_bytes(b"{")
+    result = ledger.verify_chain()
+    assert result["valid"] is False
+    assert result["reason"] == "unreadable_intent"
+
+
 def test_uncommitted_intent_fails_verify(tmp_path, ledger):
     ledger.append_evidence("attribution", 1, {"session_id": 1, "ok": True})
     intent = Path(str(ledger.db_path) + ".intent")
@@ -523,6 +532,7 @@ def test_kill9_mid_write_fail_safe():
         db_path=Path(db_path), private_key_path=Path(priv), public_key_path=Path(pub)
     )
     result = led.verify_chain()
+    assert result.get("reason") != "unreadable_intent"
     if result["incomplete_write"]:
         assert result["valid"] is False
         assert result["reason"] == "uncommitted_intent"

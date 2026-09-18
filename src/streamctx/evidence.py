@@ -581,21 +581,32 @@ class EvidenceLedger:
         self._recreate_triggers(conn)
 
     def _write_intent(self, payload: dict[str, Any]) -> None:
+        """Atomically replace the intent file.
+
+        Truncating the live ``.intent`` path then writing it made kill-9
+        able to leave a partial JSON file (``unreadable_intent``). Write
+        to ``.intent.tmp``, fsync, then ``os.replace`` so readers only
+        ever see a complete previous intent or a complete new one.
+        """
         path = self._intent_path()
+        tmp = Path(str(path) + ".tmp")
         data = canonical_json(payload).encode("utf-8")
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
             os.write(fd, data)
             os.fsync(fd)
         finally:
             os.close(fd)
+        os.replace(str(tmp), str(path))
 
     def _clear_intent(self) -> None:
         path = self._intent_path()
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        tmp = Path(str(path) + ".tmp")
+        for target in (path, tmp):
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
 
     def _load_incomplete_write(self, conn: sqlite3.Connection) -> None:
         path = self._intent_path()
