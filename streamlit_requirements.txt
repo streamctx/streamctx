@@ -1,0 +1,5 @@
+# Streamlit Community Cloud: set Main file path to streamlit_demo.py
+# and this file as the requirements file (Advanced settings).
+# streamctx is the published PyPI package (not a local path).
+streamlit>=1.32
+streamctx>=0.4.6

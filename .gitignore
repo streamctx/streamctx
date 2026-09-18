@@ -5,3 +5,5 @@ __pycache__/
 *.db
 output.txt
 artifacts/
+.streamctx_demo/
+.streamlit/secrets.toml

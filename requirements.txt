@@ -1,4 +1,4 @@
-streamctx
+streamctx>=0.4.6
 rich==13.7.0
 cryptography>=41.0.0
 supabase
@@ -6,4 +6,4 @@ httpx
 openai
 python-dotenv
 pandas
-streamlit>=1.30
+streamlit>=1.32
